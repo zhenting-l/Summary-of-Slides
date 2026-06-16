@@ -1,0 +1,161 @@
+package com.lzt.summaryofslides.ui.entrydetail
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
+import com.lzt.summaryofslides.data.AppContainer
+import com.lzt.summaryofslides.data.db.EntryEntity
+import com.lzt.summaryofslides.data.db.EntryImageEntity
+import com.lzt.summaryofslides.data.db.EntryPdfEntity
+import com.lzt.summaryofslides.data.db.SlideAnalysisEntity
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import com.lzt.summaryofslides.worker.WorkEnqueuer
+import android.content.Context
+import android.net.Uri
+import java.io.File
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+
+class EntryDetailViewModel(private val entryId: String) : ViewModel() {
+    private val repo = AppContainer.entryRepository
+
+    val entry: StateFlow<EntryEntity?> =
+        repo.observeEntry(entryId).stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
+    val images: StateFlow<List<EntryImageEntity>> =
+        repo.observeEntryImages(entryId).stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    val pdfs: StateFlow<List<EntryPdfEntity>> =
+        repo.observeEntryPdfs(entryId).stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    val analyses: StateFlow<List<SlideAnalysisEntity>> =
+        repo.observeSlideAnalyses(entryId).stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    val summaryCount: StateFlow<Int> =
+        repo.observeSummaryCount(entryId).stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0)
+
+    private val _errorMessage = MutableStateFlow<String?>(null)
+    val errorMessage: StateFlow<String?> = _errorMessage.asStateFlow()
+
+    fun importGalleryUris(uris: List<android.net.Uri>) {
+        viewModelScope.launch {
+            for (uri in uris) {
+                repo.importImageFromUri(entryId, uri)
+            }
+        }
+    }
+
+    fun importCapturedFile(tempFile: File, onDone: () -> Unit = {}) {
+        viewModelScope.launch {
+            repo.importImageFromFile(entryId, tempFile)
+            tempFile.delete()
+            onDone()
+        }
+    }
+
+    fun importSlidesPdf(uri: Uri) {
+        viewModelScope.launch {
+            runCatching { repo.importSlidesPdfFromUri(entryId, uri) }
+                .onFailure { _errorMessage.value = it.message }
+        }
+    }
+
+    fun deleteImage(imageId: String) {
+        viewModelScope.launch {
+            runCatching { repo.deleteEntryImage(entryId, imageId) }
+                .onFailure { _errorMessage.value = it.message }
+        }
+    }
+
+    fun deletePdf(pdfId: String) {
+        viewModelScope.launch {
+            runCatching { repo.deleteEntryPdf(entryId, pdfId) }
+                .onFailure { _errorMessage.value = it.message }
+        }
+    }
+
+    fun clearError() {
+        _errorMessage.value = null
+    }
+
+    fun startAnalysis(
+        context: Context,
+        extraPrompt: String? = null,
+        batchImages: Boolean = false,
+        incremental: Boolean = false,
+    ) {
+        viewModelScope.launch {
+            val running =
+                repo.observeEntries()
+                    .map { list -> list.any { (it.status == "QUEUED" || it.status == "PROCESSING") && it.id != entryId } }
+                    .first()
+            if (running) {
+                _errorMessage.value = "当前已有任务在运行（账号频率限制为1），请等待完成或先中断"
+                return@launch
+            }
+            val settings = AppContainer.settingsStore.modelSettings.first()
+            if (settings.baseUrl.isBlank() || settings.apiKey.isBlank()) {
+                _errorMessage.value = "缺少 baseUrl / apiKey"
+                return@launch
+            }
+            val images = repo.getEntryImages(entryId)
+            val pdfs = repo.getEntryPdfs(entryId)
+            val hasImages = images.isNotEmpty()
+            val hasPdfs = pdfs.isNotEmpty()
+            if (settings.generalModel.isBlank()) {
+                _errorMessage.value = "缺少通用模型"
+                return@launch
+            }
+            if (hasImages) {
+                if (settings.visionModel.isBlank()) {
+                    _errorMessage.value = "缺少视觉模型"
+                    return@launch
+                }
+            }
+            val total = images.size
+            repo.updateEntryProgress(
+                entryId = entryId,
+                status = "QUEUED",
+                stage = "QUEUED",
+                current = 0,
+                total = total,
+                message = "已加入队列",
+                lastError = null,
+            )
+            WorkEnqueuer.enqueueAnalyzeEntry(
+                context = context,
+                entryId = entryId,
+                source = "auto",
+                extraPrompt = extraPrompt?.takeIf { it.isNotBlank() },
+                batchImages = batchImages,
+                incremental = incremental,
+            )
+        }
+    }
+
+    fun cancelAnalysis(context: Context) {
+        viewModelScope.launch {
+            WorkEnqueuer.cancelAnalyzeEntry(context, entryId)
+            repo.updateEntryProgress(
+                entryId = entryId,
+                status = "CANCELLED",
+                stage = "CANCELLED",
+                current = null,
+                total = null,
+                message = "已终止",
+                lastError = null,
+            )
+        }
+    }
+}
+
+class EntryDetailViewModelFactory(private val entryId: String) : ViewModelProvider.Factory {
+    override fun <T : ViewModel> create(modelClass: Class<T>): T {
+        return EntryDetailViewModel(entryId) as T
+    }
+}
