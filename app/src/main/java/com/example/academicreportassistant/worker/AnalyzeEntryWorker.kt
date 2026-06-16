@@ -1,0 +1,1461 @@
+package com.lzt.summaryofslides.worker
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Matrix
+import android.graphics.Paint
+import android.graphics.Color
+import android.graphics.pdf.PdfRenderer
+import android.os.ParcelFileDescriptor
+import com.shockwave.pdfium.PdfDocument
+import com.shockwave.pdfium.PdfiumCore
+import androidx.work.CoroutineWorker
+import androidx.work.WorkerParameters
+import com.lzt.summaryofslides.data.AppContainer
+import com.lzt.summaryofslides.data.db.EntryImageEntity
+import com.lzt.summaryofslides.data.db.EntryPdfEntity
+import com.lzt.summaryofslides.data.db.SlideAnalysisEntity
+import com.lzt.summaryofslides.llm.OpenAiCompatClient
+import com.lzt.summaryofslides.llm.AcademicMetadataEnricher
+import com.lzt.summaryofslides.llm.ZhiPuDocParser
+import com.lzt.summaryofslides.util.ImageTranscodeUtil
+import com.lzt.summaryofslides.util.MarkdownHtmlTemplate
+import com.lzt.summaryofslides.util.MarkdownTidyUtil
+import com.lzt.summaryofslides.util.NotificationUtil
+import android.app.NotificationManager
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.first
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import java.io.File
+import java.io.ByteArrayOutputStream
+import java.io.IOException
+import java.util.UUID
+
+class AnalyzeEntryWorker(
+    appContext: Context,
+    params: WorkerParameters,
+) : CoroutineWorker(appContext, params) {
+    override suspend fun doWork(): Result {
+        val entryId = inputData.getString("entryId") ?: return Result.failure()
+        val repo = AppContainer.entryRepository
+        val settings = AppContainer.settingsStore.modelSettings.first()
+        val llm = OpenAiCompatClient()
+        val json = Json { ignoreUnknownKeys = true; isLenient = true }
+        val extraPrompt = inputData.getString("extraPrompt")?.trim()?.takeIf { it.isNotBlank() }
+        val batchImages = inputData.getBoolean("batchImages", false)
+        val incremental = inputData.getBoolean("incremental", false)
+
+        try {
+            val baseUrl = settings.baseUrl.trim()
+            val apiKey = settings.apiKey.trim()
+            if (baseUrl.isBlank() || apiKey.isBlank()) {
+                repo.updateEntryProgress(
+                    entryId = entryId,
+                    status = "FAILED",
+                    stage = "PRECHECK",
+                    current = null,
+                    total = null,
+                    message = "缺少 baseUrl / apiKey",
+                    lastError = "Missing model baseUrl/apiKey",
+                )
+                return Result.failure()
+            }
+
+            val entry = repo.getEntry(entryId)
+            val legacySlidesPdfPath = entry?.slidesPdfPath?.takeIf { it.isNotBlank() }
+            val pdfs = repo.getEntryPdfs(entryId).ifEmpty {
+                if (legacySlidesPdfPath != null) {
+                    listOf(
+                        EntryPdfEntity(
+                            id = "legacy",
+                            entryId = entryId,
+                            createdAtEpochMs = System.currentTimeMillis(),
+                            displayOrder = 1,
+                            displayName = null,
+                            localPath = legacySlidesPdfPath,
+                        ),
+                    )
+                } else {
+                    emptyList()
+                }
+            }
+            val pdfFiles = pdfs.take(3).map { File(it.localPath) }
+            val images = repo.getEntryImages(entryId)
+            val hasImages = images.isNotEmpty()
+            val hasPdfs = pdfFiles.isNotEmpty()
+            if (settings.generalModel.isBlank()) {
+                repo.updateEntryProgress(
+                    entryId = entryId,
+                    status = "FAILED",
+                    stage = "PRECHECK",
+                    current = null,
+                    total = null,
+                    message = "缺少通用模型",
+                    lastError = "Missing generalModel",
+                )
+                return Result.failure()
+            }
+            if (!hasImages && !hasPdfs) {
+                repo.updateEntryProgress(
+                    entryId = entryId,
+                    status = "FAILED",
+                    stage = "PRECHECK",
+                    current = 0,
+                    total = 0,
+                    message = "没有图片或PDF",
+                    lastError = "No images or pdf",
+                )
+                return Result.failure()
+            }
+            if (hasImages && settings.visionModel.isBlank()) {
+                repo.updateEntryProgress(
+                    entryId = entryId,
+                    status = "FAILED",
+                    stage = "PRECHECK",
+                    current = null,
+                    total = null,
+                    message = "缺少视觉模型",
+                    lastError = "Missing visionModel",
+                )
+                return Result.failure()
+            }
+            if (hasImages && settings.visionModel.contains("ocr", ignoreCase = true)) {
+                repo.updateEntryProgress(
+                    entryId = entryId,
+                    status = "FAILED",
+                    stage = "PRECHECK",
+                    current = null,
+                    total = null,
+                    message = "当前视觉模型为 glm-ocr，不支持幻灯片逐页解析",
+                    lastError = "visionModel=glm-ocr",
+                )
+                return Result.failure()
+            }
+
+            if (!hasImages && hasPdfs) {
+                repo.clearSlideAnalyses(entryId)
+                updateProgress(repo, entryId, "PROCESSING", "OCR_PDF", null, null, "调用glm-ocr解析PDF（分段）")
+                val pdfMd =
+                    parsePdfFilesToMarkdown(
+                        repo = repo,
+                        entryId = entryId,
+                        baseUrl = baseUrl,
+                        apiKey = apiKey,
+                        pdfFiles = pdfFiles,
+                    )
+                val external =
+                    if (settings.enableWebEnrichment) {
+                        updateProgress(repo, entryId, "PROCESSING", "ENRICH_WEB", null, null, "联网补充论文信息")
+                        runCatching {
+                            AcademicMetadataEnricher().enrichFromPdfMarkdown(pdfMd)
+                        }.getOrNull()
+                    } else {
+                        null
+                    }
+                val externalBlock = external?.toPromptBlock()
+                val payload =
+                    if (shouldChunkPdfMarkdown(pdfMd)) {
+                        analyzePdfMarkdownChunked(
+                            repo = repo,
+                            llm = llm,
+                            json = json,
+                            entryId = entryId,
+                            baseUrl = baseUrl,
+                            apiKey = apiKey,
+                            generalModel = settings.generalModel,
+                            pdfMd = pdfMd,
+                            extraPrompt = extraPrompt,
+                            externalMetadata = externalBlock,
+                        )
+                    } else {
+                        updateProgress(repo, entryId, "PROCESSING", "CALL_GENERAL", null, null, "调用通用模型（基于PDF文本）")
+                        val finalRaw =
+                            llm.textChatCompletion(
+                                baseUrl = baseUrl,
+                                apiKey = apiKey,
+                                model = settings.generalModel,
+                                prompt = withExternalMetadata(withExtraPrompt(pdfMarkdownPrompt(pdfMd), extraPrompt), externalBlock),
+                                maxTokens = finalSummaryMaxTokens,
+                            )
+                        parseSummaryPayload(json, finalRaw)
+                    }
+                val mdIndex = repo.getSummaryCount(entryId) + 1
+                val mdFile = summaryMarkdownFile(repo, entryId, mdIndex, payload.shortTitle ?: payload.talkTitle)
+                val htmlFile = summaryHtmlFile(repo, entryId, mdIndex, payload.shortTitle ?: payload.talkTitle)
+                val cleaned = MarkdownTidyUtil.tidy(payload.finalSummaryMarkdown)
+                mdFile.writeText(cleaned, Charsets.UTF_8)
+                val html = MarkdownHtmlTemplate.wrapStandalone(cleaned, applicationContext)
+                htmlFile.writeText(html, Charsets.UTF_8)
+                repo.setFinalResult(
+                    entryId = entryId,
+                    shortTitle = payload.shortTitle,
+                    speakerName = payload.speakerName,
+                    speakerAffiliation = payload.speakerAffiliation,
+                    talkTitle = payload.talkTitle,
+                    keywords = payload.keywords,
+                    finalSummary = cleaned,
+                    summaryMdPath = mdFile.absolutePath,
+                    summaryHtmlPath = htmlFile.absolutePath,
+                )
+                clearProgressNotification(entryId)
+                return Result.success()
+            }
+
+            val imagesForAnalysis =
+                images.map { ImageForAnalysis(it, jpegBytes = null) }
+
+            updateProgress(repo, entryId, "PROCESSING", "PRECHECK", 0, imagesForAnalysis.size, "准备开始")
+            if (!incremental) {
+                repo.clearSlideAnalyses(entryId)
+            }
+
+            val baseSummary = if (incremental) repo.getEntry(entryId)?.finalSummary else null
+            val payload =
+                analyzeImagesAndMerge(
+                    repo = repo,
+                    llm = llm,
+                    json = json,
+                    entryId = entryId,
+                    baseUrl = baseUrl,
+                    apiKey = apiKey,
+                    imagesForAnalysis = imagesForAnalysis,
+                    visionModel = settings.visionModel,
+                    generalModel = settings.generalModel,
+                    mergeWithPdfs = hasImages && hasPdfs,
+                    pdfFiles = pdfFiles,
+                    extraPrompt = extraPrompt,
+                    batchImages = batchImages,
+                    incrementalBaseSummary = baseSummary,
+                )
+            val shortTitle = payload.shortTitle
+            val speakerName = payload.speakerName
+            val speakerAffiliation = payload.speakerAffiliation
+            val talkTitle = payload.talkTitle
+            val keywords = payload.keywords
+            val finalSummary = payload.finalSummaryMarkdown
+            val slideNames = payload.slideNames
+            val slideAnalysesByImageId = repo.getSlideAnalyses(entryId).associateBy { it.imageId }
+
+            for ((idx, img) in imagesForAnalysis.withIndex()) {
+                val order = idx + 1
+                val fromAnalysis =
+                    slideAnalysesByImageId[img.entity.id]?.extractedJson?.let { extractBriefFromSlideAnalysisJson(json, it) }
+                val rawName = fromAnalysis ?: slideNames[order] ?: "第${order}页"
+                val displayName = normalizeSlideName(rawName)
+                repo.updateImageDisplay(img.entity.id, displayOrder = order, displayName = displayName)
+                renameImageFileIfPossible(repo, entryId, img.entity.localPath, img.entity.id, order, displayName)
+            }
+
+            updateProgress(repo, entryId, "PROCESSING", "GENERATE_FILE", null, null, "生成Markdown文件")
+            val mdIndex = repo.getSummaryCount(entryId) + 1
+            val mdFile = summaryMarkdownFile(repo, entryId, mdIndex, shortTitle ?: talkTitle)
+            val htmlFile = summaryHtmlFile(repo, entryId, mdIndex, shortTitle ?: talkTitle)
+            val cleaned = MarkdownTidyUtil.tidy(finalSummary)
+            mdFile.writeText(cleaned, Charsets.UTF_8)
+            val html = MarkdownHtmlTemplate.wrapStandalone(cleaned, applicationContext)
+            htmlFile.writeText(html, Charsets.UTF_8)
+
+            updateProgress(repo, entryId, "PROCESSING", "SAVE_RESULT", null, null, "保存结果")
+            repo.setFinalResult(
+                entryId = entryId,
+                shortTitle = shortTitle,
+                speakerName = speakerName,
+                speakerAffiliation = speakerAffiliation,
+                talkTitle = talkTitle,
+                keywords = keywords,
+                finalSummary = cleaned,
+                summaryMdPath = mdFile.absolutePath,
+                summaryHtmlPath = htmlFile.absolutePath,
+            )
+
+            clearProgressNotification(entryId)
+            return Result.success()
+        } catch (t: Throwable) {
+            clearProgressNotification(entryId)
+            val maxAttempts = 3
+            val shouldRetry = isRetryable(t) && runAttemptCount < maxAttempts
+            if (shouldRetry) {
+                repo.updateEntryProgress(
+                    entryId = entryId,
+                    status = "QUEUED",
+                    stage = "RETRY",
+                    current = null,
+                    total = null,
+                    message = "失败，将重试（${runAttemptCount + 1}/$maxAttempts）",
+                    lastError = t.message,
+                )
+                return Result.retry()
+            }
+            repo.updateEntryProgress(
+                entryId = entryId,
+                status = "FAILED",
+                stage = "FAILED",
+                current = null,
+                total = null,
+                message = "处理失败",
+                lastError = t.message,
+            )
+            return Result.failure()
+        }
+    }
+
+    private fun isRetryable(t: Throwable): Boolean {
+        if (t is IOException) return true
+        val cause = t.cause ?: return false
+        return isRetryable(cause)
+    }
+
+    private data class SummaryPayload(
+        val shortTitle: String?,
+        val speakerName: String?,
+        val speakerAffiliation: String?,
+        val talkTitle: String?,
+        val keywords: String?,
+        val finalSummaryMarkdown: String,
+        val slideNames: Map<Int, String>,
+    )
+
+    private fun parseSummaryPayload(json: Json, raw: String): SummaryPayload {
+        val jsonString = extractJsonBlock(raw) ?: raw
+        val root = runCatching { json.parseToJsonElement(jsonString).jsonObject }.getOrNull()
+        if (root != null) {
+            val shortTitle = root["short_title"].stringOrNull()
+            val speakerName = root["speaker_name"].stringOrNull()
+            val speakerAffiliation = root["speaker_affiliation"].stringOrNull()
+            val talkTitle = root["talk_title"].stringOrNull()
+            val keywords = root["keywords"]?.jsonArray?.joinToString(",") { it.jsonPrimitive.content }
+            val md = root["final_summary"].stringOrNull().orEmpty().ifBlank { extractMarkdownFallback(raw) }
+            val slideNames =
+                root["slide_names"]?.jsonArray
+                    ?.mapNotNull { it.jsonObjectOrNull() }
+                    ?.mapNotNull { obj ->
+                        val page = obj["page_index"]?.intOrNull() ?: return@mapNotNull null
+                        val name = obj["name"].stringOrNull() ?: return@mapNotNull null
+                        page to sanitizeName(name)
+                    }
+                    ?.toMap()
+                    ?: emptyMap()
+            return SummaryPayload(shortTitle, speakerName, speakerAffiliation, talkTitle, keywords, md, slideNames)
+        }
+
+        val shortTitle = extractLooseJsonString(raw, "short_title")
+        val speakerName = extractLooseJsonString(raw, "speaker_name")
+        val speakerAffiliation = extractLooseJsonString(raw, "speaker_affiliation")
+        val talkTitle = extractLooseJsonString(raw, "talk_title")
+        val md = extractMarkdownFallback(raw)
+        return SummaryPayload(shortTitle, speakerName, speakerAffiliation, talkTitle, null, md, emptyMap())
+    }
+
+    private suspend fun analyzeImagesAndMerge(
+        repo: com.lzt.summaryofslides.data.repo.EntryRepository,
+        llm: OpenAiCompatClient,
+        json: Json,
+        entryId: String,
+        baseUrl: String,
+        apiKey: String,
+        imagesForAnalysis: List<ImageForAnalysis>,
+        visionModel: String,
+        generalModel: String,
+        mergeWithPdfs: Boolean,
+        pdfFiles: List<File>,
+        extraPrompt: String?,
+        batchImages: Boolean,
+        incrementalBaseSummary: String?,
+    ): SummaryPayload {
+        val existing = repo.getSlideAnalyses(entryId)
+        val existingIds = existing.map { it.imageId }.toSet()
+        val newItems =
+            imagesForAnalysis
+                .mapIndexed { idx, img -> (idx + 1) to img }
+                .filter { (_, img) -> !existingIds.contains(img.entity.id) }
+        val newAnalyses = mutableListOf<SlideAnalysisEntity>()
+        if (newItems.isNotEmpty()) {
+            if (batchImages && newItems.size >= 2) {
+                val groups = newItems.chunked(4)
+                for ((gIdx, group) in groups.withIndex()) {
+                    val gCurrent = gIdx + 1
+                    val pages = group.map { it.first }
+                    updateProgress(repo, entryId, "PROCESSING", "PREPARE_IMAGE", gCurrent, groups.size, "准备图片（批量组 $gCurrent/${groups.size}）")
+                    val bytesList = mutableListOf<ByteArray>()
+                    for ((idx, item) in group.withIndex()) {
+                        val current = idx + 1
+                        updateProgress(repo, entryId, "PROCESSING", "PREPARE_IMAGE", current, group.size, "压缩图片（$current/${group.size}）")
+                        val bytes =
+                            item.second.jpegBytes
+                                ?: withContext(Dispatchers.IO) { ImageTranscodeUtil.loadAndCompressJpeg(File(item.second.entity.localPath)) }
+                        bytesList += bytes
+                    }
+                    val prompt = withExtraPrompt(slidePromptBatch(pages), extraPrompt)
+                    updateProgress(repo, entryId, "PROCESSING", "CALL_VISION", gCurrent, groups.size, "调用视觉模型（批量组 $gCurrent/${groups.size}）")
+                    val content =
+                        llm.visionChatCompletionWithJpegBytesList(
+                            baseUrl = baseUrl,
+                            apiKey = apiKey,
+                            model = visionModel,
+                            prompt = prompt,
+                            jpegBytesList = bytesList,
+                            temperature = 0.1,
+                            topP = 0.7,
+                            maxTokens = 4096,
+                        )
+                    val parsed = parseBatchSlideJson(json, content)
+                    val batchOk = parsed.isNotEmpty() && parsed.size == group.size
+                    if (batchOk) {
+                        for ((idx, item) in parsed.withIndex()) {
+                            val (page, img) = group.getOrNull(idx) ?: continue
+                            newAnalyses +=
+                                SlideAnalysisEntity(
+                                    id = UUID.randomUUID().toString(),
+                                    entryId = entryId,
+                                    imageId = img.entity.id,
+                                    extractedJson = item,
+                                    extractedText = null,
+                                    createdAtEpochMs = System.currentTimeMillis() + page,
+                                )
+                        }
+                    } else {
+                        updateProgress(repo, entryId, "PROCESSING", "FALLBACK", null, null, "批量解析失败，回退为逐页解析")
+                        for ((page, img) in group) {
+                            updateProgress(repo, entryId, "PROCESSING", "PREPARE_IMAGE", page, imagesForAnalysis.size, "第 $page 页：准备图片")
+                            val bytes =
+                                img.jpegBytes
+                                    ?: withContext(Dispatchers.IO) { ImageTranscodeUtil.loadAndCompressJpeg(File(img.entity.localPath)) }
+                            val p = withExtraPrompt(slidePrompt(page), extraPrompt)
+                            updateProgress(repo, entryId, "PROCESSING", "CALL_VISION", page, imagesForAnalysis.size, "第 $page 页：调用视觉模型")
+                            val c =
+                                llm.visionChatCompletion(
+                                    baseUrl = baseUrl,
+                                    apiKey = apiKey,
+                                    model = visionModel,
+                                    prompt = p,
+                                    jpegBytes = bytes,
+                                    temperature = 0.1,
+                                    topP = 0.7,
+                                    maxTokens = 4096,
+                                )
+                            updateProgress(repo, entryId, "PROCESSING", "PARSE_VISION", page, imagesForAnalysis.size, "第 $page 页：保存解析结果")
+                            newAnalyses +=
+                                SlideAnalysisEntity(
+                                    id = UUID.randomUUID().toString(),
+                                    entryId = entryId,
+                                    imageId = img.entity.id,
+                                    extractedJson = c,
+                                    extractedText = null,
+                                    createdAtEpochMs = System.currentTimeMillis(),
+                                )
+                        }
+                    }
+                }
+            } else {
+                for ((page, img) in newItems) {
+                    updateProgress(repo, entryId, "PROCESSING", "PREPARE_IMAGE", page, imagesForAnalysis.size, "第 $page 页：准备图片")
+                    val bytes =
+                        img.jpegBytes
+                            ?: withContext(Dispatchers.IO) { ImageTranscodeUtil.loadAndCompressJpeg(File(img.entity.localPath)) }
+                    val prompt = withExtraPrompt(slidePrompt(page), extraPrompt)
+                    updateProgress(repo, entryId, "PROCESSING", "CALL_VISION", page, imagesForAnalysis.size, "第 $page 页：调用视觉模型")
+                    val content =
+                        llm.visionChatCompletion(
+                            baseUrl = baseUrl,
+                            apiKey = apiKey,
+                            model = visionModel,
+                            prompt = prompt,
+                            jpegBytes = bytes,
+                            temperature = 0.1,
+                            topP = 0.7,
+                            maxTokens = 4096,
+                        )
+                    updateProgress(repo, entryId, "PROCESSING", "PARSE_VISION", page, imagesForAnalysis.size, "第 $page 页：保存解析结果")
+                    newAnalyses +=
+                        SlideAnalysisEntity(
+                            id = UUID.randomUUID().toString(),
+                            entryId = entryId,
+                            imageId = img.entity.id,
+                            extractedJson = content,
+                            extractedText = null,
+                            createdAtEpochMs = System.currentTimeMillis(),
+                        )
+                }
+            }
+            repo.saveSlideAnalyses(newAnalyses)
+        }
+
+        val allAnalyses = repo.getSlideAnalyses(entryId)
+        val compactForMerge = StringBuilder()
+        for ((idx, sa) in allAnalyses.withIndex()) {
+            compactForMerge.append("Slide ").append(idx + 1).append(":\n").append(sa.extractedJson.orEmpty()).append("\n\n")
+        }
+
+        updateProgress(repo, entryId, "PROCESSING", "MERGE_SUMMARY", null, null, "融合信息与生成总结")
+        val finalRaw =
+            if (mergeWithPdfs) {
+                updateProgress(repo, entryId, "PROCESSING", "OCR_PDF", null, null, "调用glm-ocr解析PDF（分段）")
+                val pdfMd =
+                    runCatching {
+                        parsePdfFilesToMarkdown(
+                            repo = repo,
+                            entryId = entryId,
+                            baseUrl = baseUrl,
+                            apiKey = apiKey,
+                            pdfFiles = pdfFiles,
+                        )
+                    }.getOrNull()
+                if (pdfMd.isNullOrBlank()) {
+                    updateProgress(repo, entryId, "PROCESSING", "FALLBACK", null, null, "PDF解析失败，忽略PDF，仅基于图片总结")
+                    llm.textChatCompletion(
+                        baseUrl = baseUrl,
+                        apiKey = apiKey,
+                        model = generalModel,
+                        prompt = withExtraPrompt(finalPrompt(compactForMerge.toString(), incrementalBaseSummary), extraPrompt),
+                        maxTokens = finalSummaryMaxTokens,
+                    )
+                } else {
+                    updateProgress(repo, entryId, "PROCESSING", "CALL_GENERAL", null, null, "调用通用模型（融合PDF文本）")
+                    llm.textChatCompletion(
+                        baseUrl = baseUrl,
+                        apiKey = apiKey,
+                        model = generalModel,
+                        prompt = withExtraPrompt(finalPromptWithPdfMarkdown(compactForMerge.toString(), pdfMd, incrementalBaseSummary), extraPrompt),
+                        maxTokens = finalSummaryMaxTokens,
+                    )
+                }
+            } else {
+                llm.textChatCompletion(
+                    baseUrl = baseUrl,
+                    apiKey = apiKey,
+                    model = generalModel,
+                    prompt = withExtraPrompt(finalPrompt(compactForMerge.toString(), incrementalBaseSummary), extraPrompt),
+                    maxTokens = finalSummaryMaxTokens,
+                )
+            }
+        return parseSummaryPayload(json, finalRaw)
+    }
+
+    private val finalSummaryMaxTokens = 16384
+    private val chunkAnalysisMaxTokens = 6144
+
+    private fun detailedFinalSummaryInstruction(): String {
+        return "详版总结正文（Markdown）。内容必须充分展开，不要只写成几句短摘要，也不要只给稀疏提纲。若材料信息充足，请优先写成较完整的研究笔记/论文解读，通常应达到 1200-3000 字以上，并尽量覆盖：1. 研究背景与问题定义 2. 核心思想总览 3. 方法/模型/算法细节 4. 关键公式与符号解释 5. 实验设置、评价指标与结果分析 6. 局限性、失败模式与可改进方向 7. 结论与个人启发。对于关键方法，必须解释其输入输出、模块组成、信息流、训练或推理步骤；对于关键思想，不要只复述结论，要说明“为什么这样设计”。对于关键公式，若原文出现了目标函数、损失函数、概率分布、优化问题、更新规则、注意力计算、复杂度表达式等，优先保留原公式，并紧接着用自然语言解释各符号、各项的含义、公式想表达的机制以及它和全文方法的关系。final_summary 必须是合法JSON字符串：换行请用 \\n，双引号请用 \\\"。数学公式使用LaTeX：块级公式用${'$'}${'$'}在独立行包裹（即${'$'}${'$'}\\n...\\n${'$'}${'$'}），行内公式用${'$'}...${'$'}且必须同一行闭合（不要在${'$'}...${'$'}中换行）。涉及上下标时使用^和_并配合大括号：x_{k}, x^{k}, x^{*}。数学环境内标点用半角(, . ; :)。不要用反引号或代码块包裹公式。为避免解析失败，不要使用Markdown表格（|---|），用标题+列表/段落表达。不要输出思维链，不要输出JSON以外的任何文本。"
+    }
+
+    private fun finalPromptWithPdfMarkdown(allSlides: String, pdfMd: String, baseSummary: String?): String {
+        return """
+你将收到同一份幻灯片材料的逐页JSON解析结果，同时还会收到由PDF版式解析器抽取出的Markdown内容。请综合两者，完成信息融合、延伸挖掘，并输出严格JSON（不要包含除JSON以外的任何文本），结构如下：
+{
+  "short_title": "为该条目生成一个最适合展示在列表页的短标题（1-3行，可中英文混用，尽量信息密度高）",
+  "speaker_name": "报告人姓名(若无法确定则空字符串)",
+  "speaker_affiliation": "单位/机构(若无法确定则空字符串)",
+  "talk_title": "报告标题(若无法确定则空字符串)",
+  "keywords": ["关键词1","关键词2"],
+  "slide_names": [{"page_index":1,"name":"封面"},{"page_index":2,"name":"目录"}],
+  "final_summary": "${detailedFinalSummaryInstruction()}"
+}
+
+上一次总结（如有）：
+${baseSummary.orEmpty().take(40_000)}
+
+逐页解析如下：
+${allSlides.take(120_000)}
+
+PDF抽取Markdown如下：
+${pdfMd.take(120_000)}
+""".trimIndent()
+    }
+
+    private fun finalPrompt(allSlides: String, baseSummary: String?): String {
+        val base = baseSummary?.takeIf { it.isNotBlank() }?.take(40_000).orEmpty()
+        if (base.isBlank()) return finalPrompt(allSlides)
+        return """
+你将收到同一份幻灯片材料的逐页JSON解析结果，以及上一次生成的总结内容。请在保持结构清晰的前提下，对总结进行增量修订：保留原有重要结构，融合新增信息，修正不准确之处。输出严格JSON（不要包含除JSON以外的任何文本），结构如下：
+{
+  "short_title": "为该条目生成一个最适合展示在列表页的短标题（1-3行，可中英文混用，尽量信息密度高）",
+  "speaker_name": "报告人姓名(若无法确定则空字符串)",
+  "speaker_affiliation": "单位/机构(若无法确定则空字符串)",
+  "talk_title": "报告标题(若无法确定则空字符串)",
+  "keywords": ["关键词1","关键词2"],
+  "slide_names": [{"page_index":1,"name":"封面"},{"page_index":2,"name":"目录"}],
+  "final_summary": "${detailedFinalSummaryInstruction()}"
+}
+
+上一次总结：
+$base
+
+逐页解析如下：
+${allSlides.take(120_000)}
+""".trimIndent()
+    }
+
+    private fun withExtraPrompt(prompt: String, extraPrompt: String?): String {
+        if (extraPrompt.isNullOrBlank()) return prompt
+        return prompt + "\n\n用户附加提示词：\n" + extraPrompt.take(4_000)
+    }
+
+    private fun withExternalMetadata(prompt: String, metadata: String?): String {
+        if (metadata.isNullOrBlank()) return prompt
+        return prompt + "\n\n外部元数据（仅用于补全报告信息与关键词；如与文档内容冲突，以文档为准；不确定则留空）：\n" + metadata.take(12_000)
+    }
+
+    private fun shouldChunkPdfMarkdown(pdfMd: String): Boolean {
+        val len = pdfMd.length
+        if (len >= 35_000) return true
+        val lower = pdfMd.lowercase()
+        val hasPaperSignals =
+            lower.contains("abstract") ||
+                lower.contains("introduction") ||
+                lower.contains("related work") ||
+                lower.contains("references") ||
+                lower.contains("bibliography")
+        return hasPaperSignals && len >= 18_000
+    }
+
+    private suspend fun analyzePdfMarkdownChunked(
+        repo: com.lzt.summaryofslides.data.repo.EntryRepository,
+        llm: OpenAiCompatClient,
+        json: Json,
+        entryId: String,
+        baseUrl: String,
+        apiKey: String,
+        generalModel: String,
+        pdfMd: String,
+        extraPrompt: String?,
+        externalMetadata: String?,
+    ): SummaryPayload {
+        updateProgress(repo, entryId, "PROCESSING", "CHUNK_PDF", null, null, "论文分块处理")
+        val chunks = chunkMarkdown(pdfMd, 12_000)
+        val chunkJsons = mutableListOf<String>()
+        for ((idx, chunk) in chunks.withIndex()) {
+            val current = idx + 1
+            updateProgress(repo, entryId, "PROCESSING", "CHUNK_PDF", current, chunks.size, "分块分析（$current/${chunks.size}）")
+            val raw =
+                llm.textChatCompletion(
+                    baseUrl = baseUrl,
+                    apiKey = apiKey,
+                    model = generalModel,
+                    prompt = withExtraPrompt(pdfChunkPrompt(current, chunks.size, chunk), extraPrompt),
+                    maxTokens = chunkAnalysisMaxTokens,
+                )
+            val block = extractJsonBlock(raw) ?: raw
+            chunkJsons += block.trim()
+        }
+
+        updateProgress(repo, entryId, "PROCESSING", "CALL_GENERAL", null, null, "融合分块结果生成总结")
+        val finalRaw =
+            llm.textChatCompletion(
+                baseUrl = baseUrl,
+                apiKey = apiKey,
+                model = generalModel,
+                prompt = withExternalMetadata(withExtraPrompt(pdfChunkMergePrompt(chunkJsons), extraPrompt), externalMetadata),
+                maxTokens = finalSummaryMaxTokens,
+            )
+        return parseSummaryPayload(json, finalRaw)
+    }
+
+    private fun chunkMarkdown(md: String, maxChars: Int): List<String> {
+        val text = md.replace("\r\n", "\n").trim()
+        if (text.length <= maxChars) return listOf(text)
+        val lines = text.split('\n')
+        val chunks = mutableListOf<StringBuilder>()
+        var cur = StringBuilder()
+        fun push() {
+            if (cur.isNotBlank()) chunks += cur
+            cur = StringBuilder()
+        }
+        for (line in lines) {
+            if (cur.length + line.length + 1 > maxChars && cur.isNotBlank()) push()
+            cur.append(line).append('\n')
+        }
+        push()
+        return chunks.map { it.toString().trim() }.filter { it.isNotBlank() }
+    }
+
+    private fun pdfChunkPrompt(index: Int, total: Int, md: String): String {
+        return """
+你是论文解析助手。下面给出一篇论文的第 $index/$total 个分块（由PDF版式解析器抽取的Markdown）。请只基于该分块内容进行结构化提取，输出严格JSON（不要包含除JSON以外的任何文本）：
+{
+  "chunk_index": $index,
+  "chunk_title": "该分块所属章节/主题（尽量短，无法判断则空字符串）",
+  "key_points": ["要点1","要点2"],
+  "methods": ["方法/模型/算法名称（可空）"],
+  "method_details": ["对关键方法的展开说明（可空）。尽量写清输入、输出、模块组成、训练/推理流程、与基线差异"],
+  "equations": ["关键公式（可空）。若有公式请尽量保留原式，使用可编译LaTeX并写清上下标：x_{k}, x^{k}。"],
+  "equation_explanations": ["对关键公式逐项解释（可空）。说明符号含义、目标函数/约束/更新规则以及公式作用"],
+  "claims": ["定理/结论/贡献点（可空）"],
+  "experiments": ["实验设置/数据集/指标/结果（可空）"],
+  "limitations": ["局限性、适用边界、失败模式（可空）"],
+  "citations": ["引用/参考文献线索（可空）"],
+  "terms": ["术语及简短解释（可空）"]
+}
+
+分块Markdown如下：
+${md.take(15_000)}
+""".trimIndent()
+    }
+
+    private fun pdfChunkMergePrompt(chunkJsons: List<String>): String {
+        val joined = chunkJsons.joinToString(",\n")
+        return """
+你将收到同一篇论文的多个分块解析结果（JSON数组元素）。请综合所有分块信息，生成最终论文总结，并输出严格JSON（不要包含除JSON以外的任何文本），结构如下：
+{
+  "short_title": "为该条目生成一个最适合展示在列表页的短标题（1-3行，可中英文混用，尽量信息密度高）",
+  "speaker_name": "",
+  "speaker_affiliation": "",
+  "talk_title": "",
+  "keywords": ["关键词1","关键词2"],
+  "final_summary": "${detailedFinalSummaryInstruction()}"
+}
+
+分块解析结果如下（按chunk_index排序但可能不连续）：
+[
+$joined
+]
+""".trimIndent()
+    }
+
+    private fun slidePromptBatch(pages: List<Int>): String {
+        val p = pages.joinToString(", ")
+        return """
+你将收到多张幻灯片图片（页码分别为：$p）。请按图片顺序输出严格JSON数组（不要包含除JSON以外的任何文本），数组每个元素结构与单页相同：
+{
+  "page_index": 1,
+  "section": "本页所属章节/主题(可空)",
+  "main_points": ["要点1","要点2"],
+  "methods": ["方法/模型/算法(可空)"],
+  "equations": ["公式/符号解释(可空)。必须输出可编译的LaTeX（不要加${'$'}或${'$'}${'$'}）。上下标必须用^/_并配合花括号：x_{k}, x^{k}, x^{*}。算子必须带反斜杠：\\sin, \\log, \\max, \\arg\\min, \\det。偏导用\\partial，梯度用\\nabla，分数用\\frac。多行对齐公式用\\begin{aligned}...\\end{aligned}并用\\\\换行、&对齐。"],
+  "figures": ["图表/示意图描述(可空)"],
+  "citations": ["出现的论文/作者/会议期刊/DOI/链接线索(可空)"],
+  "terms": ["术语及简短解释(可空)"],
+  "raw_text": "尽可能完整的可读文本(可空)"
+}
+
+要求：
+1) JSON数组长度必须等于图片数量（${pages.size}）
+2) 每个元素的 page_index 必须与对应图片页码一致（按顺序分别为：$p）
+""".trimIndent()
+    }
+
+    private fun parseBatchSlideJson(json: Json, raw: String): List<String> {
+        val block = extractJsonArrayBlock(raw) ?: raw
+        val el = runCatching { json.parseToJsonElement(block) }.getOrNull() ?: return emptyList()
+        val arr =
+            (el as? kotlinx.serialization.json.JsonArray)
+                ?: (el.jsonObjectOrNull()
+                    ?.values
+                    ?.firstOrNull { it is kotlinx.serialization.json.JsonArray } as? kotlinx.serialization.json.JsonArray)
+                ?: return emptyList()
+        return arr.map { it.toString() }
+    }
+
+    private fun extractJsonArrayBlock(text: String): String? {
+        val fenced = Regex("```json\\s*([\\s\\S]*?)\\s*```").find(text)?.groupValues?.getOrNull(1)?.trim()
+        if (!fenced.isNullOrBlank() && fenced.startsWith("[")) return fenced
+        val start = text.indexOf('[')
+        val end = text.lastIndexOf(']')
+        if (start >= 0 && end > start) return text.substring(start, end + 1).trim()
+        return null
+    }
+
+    private fun extractBriefFromSlideAnalysisJson(json: Json, raw: String): String? {
+        val block = extractJsonBlock(raw) ?: raw
+        val obj = runCatching { json.parseToJsonElement(block).jsonObject }.getOrNull() ?: return null
+        val section = obj["section"]?.stringOrNull()?.trim().orEmpty()
+        val main =
+            obj["main_points"]
+                ?.jsonArray
+                ?.firstOrNull()
+                ?.jsonPrimitive
+                ?.content
+                ?.trim()
+                .orEmpty()
+        val pick = (if (section.isNotBlank()) section else main).trim()
+        return pick.takeIf { it.isNotBlank() }
+    }
+
+    private suspend fun renderPdfToImageFiles(
+        repo: com.lzt.summaryofslides.data.repo.EntryRepository,
+        entryId: String,
+        pdfFiles: List<File>,
+    ): List<File> {
+        val pagesDir = repo.entryPdfPagesDir(entryId)
+        pagesDir.deleteRecursively()
+        pagesDir.mkdirs()
+        val outFiles = mutableListOf<File>()
+        val maxTotalPages = 100
+        val totalPages = pdfFiles.sumOf { file -> countPdfPages(file) }.coerceAtLeast(1).coerceAtMost(maxTotalPages)
+        val paperLike = isLikelyPaperPdf(pdfFiles, totalPages)
+        var renderedCount = 0
+
+        if (paperLike) {
+            runCatching {
+                val pdfium = PdfiumCore(AppContainer.appContext)
+                outer@ for ((pdfIdx, pdfFile) in pdfFiles.withIndex()) {
+                    if (!pdfFile.exists()) continue
+                    val fd = ParcelFileDescriptor.open(pdfFile, ParcelFileDescriptor.MODE_READ_ONLY)
+                    val doc: PdfDocument
+                    try {
+                        doc = pdfium.newDocument(fd)
+                    } catch (e: Exception) {
+                        fd.close()
+                        continue
+                    }
+                    try {
+                        val pageCount = pdfium.getPageCount(doc)
+                        for (i in 0 until pageCount) {
+                            if (renderedCount >= maxTotalPages) break@outer
+                            renderedCount += 1
+                            updateProgress(repo, entryId, "PROCESSING", "RENDER_PDF", renderedCount, totalPages, "渲染PDF（PDFium，$renderedCount/$totalPages）")
+                            pdfium.openPage(doc, i)
+                            val w = pdfium.getPageWidthPoint(doc, i)
+                            val h = pdfium.getPageHeightPoint(doc, i)
+                            val bitmap =
+                                renderPdfPageBitmap(w, h) { bitmap, bmpW, bmpH ->
+                                    pdfium.renderPageBitmap(doc, bitmap, i, 0, 0, bmpW, bmpH)
+                                }
+                            val pageIndex = i + 1
+                            val parts = splitIfPaper(bitmap)
+                            bitmap.recycle()
+                            for (part in parts) {
+                                val outFile = File(pagesDir, "pdf${pdfIdx + 1}_page_$pageIndex${part.suffix}.jpg")
+                                writeJpegWhiteBackground(outFile, part.bitmap, 92)
+                                outFiles += outFile
+                                part.bitmap.recycle()
+                            }
+                        }
+                    } finally {
+                        runCatching { pdfium.closeDocument(doc) }
+                        runCatching { fd.close() }
+                    }
+                }
+            }.onSuccess {
+                if (outFiles.isNotEmpty()) return outFiles
+            }
+        }
+
+        outer@ for ((pdfIdx, pdfFile) in pdfFiles.withIndex()) {
+            if (!pdfFile.exists()) continue
+            val fd = ParcelFileDescriptor.open(pdfFile, ParcelFileDescriptor.MODE_READ_ONLY)
+            try {
+                val renderer = PdfRenderer(fd)
+                try {
+                    val pageCount = renderer.pageCount
+                    for (i in 0 until pageCount) {
+                        if (renderedCount >= maxTotalPages) break@outer
+                        renderedCount += 1
+                        updateProgress(repo, entryId, "PROCESSING", "RENDER_PDF", renderedCount, totalPages, "渲染PDF（$renderedCount/$totalPages）")
+                        val pageIndex = i + 1
+                        val page = renderer.openPage(i)
+                        val targetMaxSide = 2200f
+                        var scale = (targetMaxSide / maxOf(page.width, page.height).toFloat()).coerceAtLeast(1f).coerceAtMost(3f)
+                        var bmpW = (page.width * scale).toInt().coerceAtLeast(1)
+                        var bmpH = (page.height * scale).toInt().coerceAtLeast(1)
+                        val maxPixels = 10_000_000L
+                        val pixels = bmpW.toLong() * bmpH.toLong()
+                        if (pixels > maxPixels) {
+                            val factor = kotlin.math.sqrt(maxPixels.toDouble() / pixels.toDouble()).toFloat().coerceAtMost(1f)
+                            scale *= factor
+                            bmpW = (page.width * scale).toInt().coerceAtLeast(1)
+                            bmpH = (page.height * scale).toInt().coerceAtLeast(1)
+                        }
+
+                        val bitmap = Bitmap.createBitmap(bmpW, bmpH, Bitmap.Config.ARGB_8888)
+                        bitmap.eraseColor(Color.WHITE)
+                        val matrix = Matrix().apply { setScale(scale, scale) }
+                        page.render(bitmap, null, matrix, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                        page.close()
+
+                        val parts = if (paperLike) splitIfPaper(bitmap) else listOf(PdfPageSlice("", bitmap))
+                        if (!paperLike) {
+                            val outFile = File(pagesDir, "pdf${pdfIdx + 1}_page_$pageIndex.jpg")
+                            writeJpegWhiteBackground(outFile, bitmap, 92)
+                            outFiles += outFile
+                            bitmap.recycle()
+                        } else {
+                            bitmap.recycle()
+                            for (part in parts) {
+                                val outFile = File(pagesDir, "pdf${pdfIdx + 1}_page_$pageIndex${part.suffix}.jpg")
+                                writeJpegWhiteBackground(outFile, part.bitmap, 92)
+                                outFiles += outFile
+                                part.bitmap.recycle()
+                            }
+                        }
+                    }
+                } finally {
+                    renderer.close()
+                }
+            } finally {
+                fd.close()
+            }
+        }
+        return outFiles
+    }
+
+    private fun isLikelyPaperPdf(pdfFiles: List<File>, totalPages: Int): Boolean {
+        if (totalPages < 8) return false
+        val first = pdfFiles.firstOrNull { it.exists() } ?: return false
+        return runCatching {
+            val fd = ParcelFileDescriptor.open(first, ParcelFileDescriptor.MODE_READ_ONLY)
+            fd.use { pfd ->
+                PdfRenderer(pfd).use { renderer ->
+                    if (renderer.pageCount <= 0) return@use false
+                    renderer.openPage(0).use { page ->
+                        val w = page.width.toFloat().coerceAtLeast(1f)
+                        val h = page.height.toFloat().coerceAtLeast(1f)
+                        val portrait = h >= w
+                        val ratio = w / h
+                        portrait && ratio <= 0.82f
+                    }
+                }
+            }
+        }.getOrDefault(false)
+    }
+
+    private fun renderPdfPageBitmap(
+        pageW: Int,
+        pageH: Int,
+        render: (bitmap: Bitmap, bmpW: Int, bmpH: Int) -> Unit,
+    ): Bitmap {
+        val targetMaxSide = 2600f
+        var scale = (targetMaxSide / maxOf(pageW, pageH).toFloat()).coerceAtLeast(1f).coerceAtMost(3f)
+        var bmpW = (pageW * scale).toInt().coerceAtLeast(1)
+        var bmpH = (pageH * scale).toInt().coerceAtLeast(1)
+        val maxPixels = 10_000_000L
+        val pixels = bmpW.toLong() * bmpH.toLong()
+        if (pixels > maxPixels) {
+            val factor = kotlin.math.sqrt(maxPixels.toDouble() / pixels.toDouble()).toFloat().coerceAtMost(1f)
+            scale *= factor
+            bmpW = (pageW * scale).toInt().coerceAtLeast(1)
+            bmpH = (pageH * scale).toInt().coerceAtLeast(1)
+        }
+        val bitmap = Bitmap.createBitmap(bmpW, bmpH, Bitmap.Config.ARGB_8888)
+        bitmap.eraseColor(Color.WHITE)
+        render(bitmap, bmpW, bmpH)
+        val flattened = Bitmap.createBitmap(bmpW, bmpH, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(flattened)
+        canvas.drawColor(Color.WHITE)
+        canvas.drawBitmap(bitmap, 0f, 0f, Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG))
+        bitmap.recycle()
+        return flattened
+    }
+
+    private data class PdfPageSlice(
+        val suffix: String,
+        val bitmap: Bitmap,
+    )
+
+    private fun splitIfPaper(bitmap: Bitmap): List<PdfPageSlice> {
+        if (bitmap.width >= bitmap.height) return listOf(PdfPageSlice("", bitmap.copy(Bitmap.Config.ARGB_8888, false)))
+        val plan = buildTwoColumnSplitPlan(bitmap)
+        if (plan.isEmpty()) return listOf(PdfPageSlice("", bitmap.copy(Bitmap.Config.ARGB_8888, false)))
+        return applySplitPlan(bitmap, plan)
+    }
+
+    private enum class BandType {
+        TwoColumn,
+        Span,
+        Other,
+    }
+
+    private data class SplitBand(
+        val y0Ratio: Float,
+        val y1Ratio: Float,
+        val type: BandType,
+    )
+
+    private fun buildTwoColumnSplitPlan(bitmap: Bitmap): List<SplitBand> {
+        if (bitmap.width < 800 || bitmap.height < 800) return emptyList()
+        val sw = minOf(240, bitmap.width)
+        val sh =
+            ((bitmap.height.toFloat() * sw.toFloat()) / bitmap.width.toFloat())
+                .toInt()
+                .coerceAtMost(360)
+                .coerceAtLeast(120)
+        val small = Bitmap.createScaledBitmap(bitmap, sw, sh, true)
+        try {
+            val pixels = IntArray(sw * sh)
+            small.getPixels(pixels, 0, sw, 0, 0, sw, sh)
+
+            fun density(x0: Int, x1: Int, y0: Int, y1: Int): Double {
+                val start = x0.coerceAtLeast(0)
+                val end = x1.coerceAtMost(sw)
+                val top = y0.coerceAtLeast(0)
+                val bottom = y1.coerceAtMost(sh)
+                if (end <= start || bottom <= top) return 1.0
+                var dark = 0
+                var total = 0
+                var y = top
+                while (y < bottom) {
+                    var x = start
+                    while (x < end) {
+                        val c = pixels[y * sw + x]
+                        val r = (c shr 16) and 0xff
+                        val g = (c shr 8) and 0xff
+                        val b = c and 0xff
+                        val v = (r + g + b) / 3
+                        if (v < 245) dark += 1
+                        total += 1
+                        x += 2
+                    }
+                    y += 2
+                }
+                if (total <= 0) return 1.0
+                return dark.toDouble() / total.toDouble()
+            }
+
+            val bandW = (sw * 0.10f).toInt().coerceAtLeast(12).coerceAtMost(48)
+            val midStart = ((sw - bandW) / 2).coerceAtLeast(0)
+            val midEnd = (midStart + bandW).coerceAtMost(sw)
+
+            fun classify(y0: Int, y1: Int): BandType {
+                val center = density(midStart, midEnd, y0, y1)
+                val left = density(0, midStart, y0, y1)
+                val right = density(midEnd, sw, y0, y1)
+                val leftN = density((midStart - bandW * 2).coerceAtLeast(0), (midStart - bandW).coerceAtLeast(0), y0, y1)
+                val rightN = density((midEnd + bandW).coerceAtMost(sw), (midEnd + bandW * 2).coerceAtMost(sw), y0, y1)
+
+                val twoCol = center < 0.006 && leftN > 0.012 && rightN > 0.012
+                if (twoCol) return BandType.TwoColumn
+
+                val span = center > 0.012 && (left > 0.010 || right > 0.010) && (leftN > 0.008 || rightN > 0.008)
+                if (span) return BandType.Span
+
+                return BandType.Other
+            }
+
+            val bandCount = 6
+            val bandH = (sh / bandCount).coerceAtLeast(8)
+            val rawBands = mutableListOf<SplitBand>()
+            var y = 0
+            while (y < sh) {
+                val y1 = (y + bandH).coerceAtMost(sh)
+                rawBands += SplitBand(y.toFloat() / sh.toFloat(), y1.toFloat() / sh.toFloat(), classify(y, y1))
+                y = y1
+            }
+
+            val hasTwoCol = rawBands.any { it.type == BandType.TwoColumn }
+            if (!hasTwoCol) return emptyList()
+
+            val merged = mutableListOf<SplitBand>()
+            for (b in rawBands) {
+                val last = merged.lastOrNull()
+                if (last != null && last.type == b.type) {
+                    merged[merged.lastIndex] = last.copy(y1Ratio = b.y1Ratio)
+                } else {
+                    merged += b
+                }
+            }
+
+            return merged.filter { it.y1Ratio > it.y0Ratio }
+        } finally {
+            small.recycle()
+        }
+    }
+
+    private fun applySplitPlan(bitmap: Bitmap, plan: List<SplitBand>): List<PdfPageSlice> {
+        val w = bitmap.width
+        val h = bitmap.height
+        val mid = (w / 2).coerceAtLeast(1)
+        val out = mutableListOf<PdfPageSlice>()
+        var bandIndex = 0
+        for (seg in plan) {
+            val y0 = (seg.y0Ratio * h.toFloat()).toInt().coerceAtLeast(0).coerceAtMost(h)
+            val y1 = (seg.y1Ratio * h.toFloat()).toInt().coerceAtLeast(0).coerceAtMost(h)
+            val top = minOf(y0, y1)
+            val bottom = maxOf(y0, y1)
+            val segH = (bottom - top).coerceAtLeast(1)
+            val bandView = Bitmap.createBitmap(bitmap, 0, top, w, segH)
+            val band = bandView.copy(Bitmap.Config.ARGB_8888, false)
+            bandView.recycle()
+            bandIndex += 1
+            val segIndex = bandIndex
+            when (seg.type) {
+                BandType.TwoColumn -> {
+                    val leftView = Bitmap.createBitmap(band, 0, 0, mid, segH)
+                    val rightView = Bitmap.createBitmap(band, mid, 0, (w - mid).coerceAtLeast(1), segH)
+                    val left = leftView.copy(Bitmap.Config.ARGB_8888, false)
+                    val right = rightView.copy(Bitmap.Config.ARGB_8888, false)
+                    leftView.recycle()
+                    rightView.recycle()
+                    band.recycle()
+                    out += PdfPageSlice("_${segIndex}L", left)
+                    out += PdfPageSlice("_${segIndex}R", right)
+                }
+                BandType.Span, BandType.Other -> {
+                    out += PdfPageSlice("_${segIndex}S", band)
+                }
+            }
+        }
+        return out
+    }
+
+    private fun writeJpegWhiteBackground(outFile: File, bitmap: Bitmap, quality: Int) {
+        val flattened = Bitmap.createBitmap(bitmap.width, bitmap.height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(flattened)
+        canvas.drawColor(Color.WHITE)
+        canvas.drawBitmap(bitmap, 0f, 0f, Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG))
+        val baos = ByteArrayOutputStream()
+        flattened.compress(Bitmap.CompressFormat.JPEG, quality, baos)
+        flattened.recycle()
+        outFile.outputStream().use { it.write(baos.toByteArray()) }
+    }
+
+    private fun countPdfPages(file: File): Int {
+        if (!file.exists()) return 0
+        val pfd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+        pfd.use { fd ->
+            PdfRenderer(fd).use { renderer ->
+                return renderer.pageCount
+            }
+        }
+    }
+
+    private fun extractLooseJsonString(raw: String, key: String): String? {
+        val r = Regex(""""$key"\s*:\s*"([^"]*)"""")
+        return r.find(raw)?.groupValues?.getOrNull(1)?.trim()?.takeIf { it.isNotBlank() }
+    }
+
+    private fun extractMarkdownFallback(raw: String): String {
+        val fenced =
+            Regex("```(?:markdown|md)\\s*([\\s\\S]*?)\\s*```", RegexOption.IGNORE_CASE)
+                .find(raw)
+                ?.groupValues
+                ?.getOrNull(1)
+                ?.trim()
+        if (!fenced.isNullOrBlank()) return fenced
+
+        val startFrom = raw.indexOf("final_summary").takeIf { it >= 0 } ?: 0
+        val segment = raw.substring(startFrom)
+        val marker = Regex("(?m)^\\s*\"?#\\s+").find(segment)
+        if (marker != null) {
+            var md = segment.substring(marker.range.first).trim()
+            if (md.startsWith("\"#")) md = md.drop(1)
+            md = md.trimEnd()
+            md = md.removeSuffix("\"")
+            md = md.removeSuffix("}")
+            md = md.removeSuffix("\"")
+            return md.trim()
+        }
+        val hashIndex = segment.indexOf('#')
+        if (hashIndex >= 0) {
+            var md = segment.substring(hashIndex).trim()
+            md = md.removeSuffix("\"")
+            md = md.removeSuffix("}")
+            md = md.removeSuffix("\"")
+            return md.trim()
+        }
+        return raw.trim()
+    }
+
+    private data class ImageForAnalysis(
+        val entity: EntryImageEntity,
+        val jpegBytes: ByteArray?,
+    )
+
+    private fun slidePrompt(pageIndex: Int): String {
+        return """
+你是幻灯片内容解析助手。请阅读第 $pageIndex 张幻灯片图片，输出严格JSON（不要包含除JSON以外的任何文本），字段如下：
+{
+  "page_index": $pageIndex,
+  "section": "本页所属章节/主题(可空)",
+  "main_points": ["要点1","要点2"],
+  "methods": ["方法/模型/算法(可空)"],
+  "equations": ["公式/符号解释(可空)。必须输出可编译的LaTeX（不要加${'$'}或${'$'}${'$'}）。上下标必须用^/_并配合花括号：x_{k}, x^{k}, x^{*}。算子必须带反斜杠：\\sin, \\log, \\max, \\arg\\min, \\det。偏导用\\partial，梯度用\\nabla，分数用\\frac。多行对齐公式用\\begin{aligned}...\\end{aligned}并用\\\\换行、&对齐。"],
+  "figures": ["图表/示意图描述(可空)"],
+  "citations": ["出现的论文/作者/会议期刊/DOI/链接线索(可空)"],
+  "terms": ["术语及简短解释(可空)"],
+  "raw_text": "尽可能完整的可读文本(可空)"
+}
+""".trimIndent()
+    }
+
+    private fun finalPrompt(allSlides: String): String {
+        return """
+你将收到同一份幻灯片材料的逐页JSON解析结果。请完成信息融合、延伸挖掘，并输出严格JSON（不要包含除JSON以外的任何文本），结构如下：
+{
+  "short_title": "为该条目生成一个最适合展示在列表页的短标题（1-3行，可中英文混用，尽量信息密度高）",
+  "speaker_name": "报告人姓名(若无法确定则空字符串)",
+  "speaker_affiliation": "单位/机构(若无法确定则空字符串)",
+  "talk_title": "报告标题(若无法确定则空字符串)",
+  "keywords": ["关键词1","关键词2"],
+  "slide_names": [{"page_index":1,"name":"封面"},{"page_index":2,"name":"目录"}],
+  "final_summary": "${detailedFinalSummaryInstruction()}"
+}
+
+逐页解析如下：
+${allSlides.take(120_000)}
+""".trimIndent()
+    }
+
+    private fun extractJsonBlock(text: String): String? {
+        val fenced = Regex("```json\\s*([\\s\\S]*?)\\s*```").find(text)?.groupValues?.getOrNull(1)
+        if (!fenced.isNullOrBlank()) return fenced.trim()
+        val start = text.indexOf('{')
+        val end = text.lastIndexOf('}')
+        if (start >= 0 && end > start) return text.substring(start, end + 1)
+        return null
+    }
+
+    private fun JsonElement?.stringOrNull(): String? {
+        val p = this as? JsonPrimitive ?: return null
+        if (p is JsonNull) return null
+        return p.content
+    }
+
+    private fun JsonElement?.intOrNull(): Int? {
+        val p = this as? JsonPrimitive ?: return null
+        return p.intOrNull
+    }
+
+    private fun JsonElement?.jsonObjectOrNull() =
+        runCatching { this?.jsonObject }.getOrNull()
+
+    private fun sanitizeName(raw: String): String {
+        val cleaned = raw.trim().replace(Regex("""[\\/:*?"<>|]"""), " ")
+        return cleaned.replace(Regex("""\s+"""), " ").trim().take(40).ifBlank { "未命名" }
+    }
+
+    private suspend fun parsePdfFilesToMarkdown(
+        repo: com.lzt.summaryofslides.data.repo.EntryRepository,
+        entryId: String,
+        baseUrl: String,
+        apiKey: String,
+        pdfFiles: List<File>,
+    ): String {
+        if (!isZhiPuForLayoutParsing(baseUrl)) throw IllegalStateException("当前供应商不支持PDF解析")
+        val sb = StringBuilder()
+        for ((idx, file) in pdfFiles.withIndex()) {
+            val current = idx + 1
+            val parser = ZhiPuDocParser()
+            val totalPages = countPdfPages(file).coerceAtLeast(1)
+            val ranges = buildPdfPageRanges(totalPages, 40)
+            val fileMd = StringBuilder()
+            var segmentFailed = false
+            for ((rangeIdx, range) in ranges.withIndex()) {
+                val segmentCurrent = rangeIdx + 1
+                updateProgress(
+                    repo = repo,
+                    entryId = entryId,
+                    status = "PROCESSING",
+                    stage = "OCR_PDF",
+                    current = segmentCurrent,
+                    total = ranges.size,
+                    message = "调用glm-ocr解析PDF（文档$current/${pdfFiles.size}，分段$segmentCurrent/${ranges.size}）",
+                )
+                val md =
+                    runCatching {
+                        parser.parsePdfToMarkdown(
+                            baseUrl = baseUrl,
+                            apiKey = apiKey,
+                            pdfFile = file,
+                            startPageId = range.first,
+                            endPageId = range.last,
+                        )
+                    }.getOrNull()
+                if (md.isNullOrBlank()) {
+                    segmentFailed = true
+                    break
+                }
+                fileMd
+                    .append("\n\n")
+                    .append("### Segment ")
+                    .append(segmentCurrent)
+                    .append(" (pages ")
+                    .append(range.first)
+                    .append('-')
+                    .append(range.last)
+                    .append(")\n\n")
+                    .append(md.trim())
+            }
+            val md =
+                if (segmentFailed || fileMd.isBlank()) {
+                    updateProgress(repo, entryId, "PROCESSING", "FALLBACK", null, null, "分段PDF解析失败，回退为逐页glm-ocr")
+                    parseRenderedPdfPagesToMarkdown(repo, entryId, baseUrl, apiKey, file)
+                } else {
+                    fileMd.toString().trim()
+                }
+            sb.append("\n\n").append("## Document ").append(current).append("\n\n").append(md)
+        }
+        return sb.toString().trim()
+    }
+
+    private fun buildPdfPageRanges(totalPages: Int, maxPagesPerSegment: Int): List<IntRange> {
+        val safeTotal = totalPages.coerceAtLeast(1)
+        val safeChunk = maxPagesPerSegment.coerceAtLeast(1)
+        val ranges = mutableListOf<IntRange>()
+        var start = 1
+        while (start <= safeTotal) {
+            val end = (start + safeChunk - 1).coerceAtMost(safeTotal)
+            ranges += start..end
+            start = end + 1
+        }
+        return ranges
+    }
+
+    private suspend fun parseRenderedPdfPagesToMarkdown(
+        repo: com.lzt.summaryofslides.data.repo.EntryRepository,
+        entryId: String,
+        baseUrl: String,
+        apiKey: String,
+        pdfFile: File,
+    ): String {
+        val pageFiles = renderPdfToImageFiles(repo, entryId, listOf(pdfFile))
+        if (pageFiles.isEmpty()) throw IllegalStateException("PDF渲染失败")
+        val parser = ZhiPuDocParser()
+        val sb = StringBuilder()
+        for ((idx, file) in pageFiles.withIndex()) {
+            val current = idx + 1
+            updateProgress(repo, entryId, "PROCESSING", "OCR_PDF", current, pageFiles.size, "逐页glm-ocr解析（$current/${pageFiles.size}）")
+            val md =
+                parser.parsePdfToMarkdown(
+                    baseUrl = baseUrl,
+                    apiKey = apiKey,
+                    pdfFile = file,
+                    startPageId = null,
+                    endPageId = null,
+                )
+            if (md.isNotBlank()) {
+                sb.append("\n\n").append("## Page ").append(current).append("\n\n").append(md.trim())
+            }
+        }
+        return sb.toString().trim().ifBlank { throw IllegalStateException("逐页glm-ocr解析失败") }
+    }
+
+    private fun isZhiPuForLayoutParsing(baseUrl: String): Boolean {
+        val lower = baseUrl.lowercase()
+        return lower.contains("/api/paas/v4") || lower.contains("/api/coding/paas/v4")
+    }
+
+    private fun pdfMarkdownPrompt(md: String): String {
+        return """
+你将收到一份由PDF版式解析器抽取出的Markdown内容（可能包含公式、表格、章节结构）。请只基于该内容进行学术报告/幻灯片材料总结与延伸挖掘，并输出严格JSON（不要包含除JSON以外的任何文本），结构如下：
+{
+  "short_title": "为该条目生成一个最适合展示在列表页的短标题（1-3行，可中英文混用，尽量信息密度高）",
+  "speaker_name": "报告人姓名(若无法确定则空字符串)",
+  "speaker_affiliation": "单位/机构(若无法确定则空字符串)",
+  "talk_title": "报告标题(若无法确定则空字符串)",
+  "keywords": ["关键词1","关键词2"],
+  "final_summary": "${detailedFinalSummaryInstruction()}"
+}
+
+文档Markdown如下：
+${md.take(120_000)}
+""".trimIndent()
+    }
+
+    private fun summaryMarkdownFile(
+        repo: com.lzt.summaryofslides.data.repo.EntryRepository,
+        entryId: String,
+        index: Int,
+        title: String?,
+    ): File {
+        val base = sanitizeFileStem(title ?: "summary")
+        val prefix = "S$index-"
+        return File(repo.entryDir(entryId), "$prefix$base.md")
+    }
+
+    private fun summaryHtmlFile(
+        repo: com.lzt.summaryofslides.data.repo.EntryRepository,
+        entryId: String,
+        index: Int,
+        title: String?,
+    ): File {
+        val base = sanitizeFileStem(title ?: "summary")
+        val prefix = "H$index-"
+        return File(repo.entryDir(entryId), "$prefix$base.html")
+    }
+
+    private fun sanitizeFileStem(raw: String): String {
+        return raw.trim()
+            .replace(Regex("""[\\/:*?"<>|]"""), " ")
+            .replace(Regex("""\s+"""), " ")
+            .trim()
+            .take(80)
+            .ifBlank { "summary" }
+    }
+
+    private fun normalizeSlideName(raw: String): String {
+        return raw.trim()
+            .replace(Regex("""[\r\n]+"""), " ")
+            .replace(Regex("""\s+"""), " ")
+            .trim()
+            .take(24)
+            .ifBlank { "未命名" }
+    }
+
+    private suspend fun renameImageFileIfPossible(
+        repo: com.lzt.summaryofslides.data.repo.EntryRepository,
+        entryId: String,
+        currentPath: String,
+        imageId: String,
+        order: Int,
+        displayName: String,
+    ) {
+        val imagesDir = repo.entryImagesDir(entryId)
+        val current = File(currentPath)
+        if (!current.exists()) return
+        val stem = sanitizeFileStem(displayName).take(40)
+        val target = File(imagesDir, "${order}-${stem}.jpg")
+        val out =
+            if (target.exists() && target.absolutePath != current.absolutePath) {
+                File(imagesDir, "${order}-${stem}-${imageId.take(4)}.jpg")
+            } else {
+                target
+            }
+        if (out.absolutePath == current.absolutePath) return
+        val ok = runCatching { current.renameTo(out) }.getOrDefault(false)
+        if (ok) {
+            repo.updateImageLocalPath(imageId, out.absolutePath)
+        }
+    }
+
+    private suspend fun updateProgress(
+        repo: com.lzt.summaryofslides.data.repo.EntryRepository,
+        entryId: String,
+        status: String,
+        stage: String?,
+        current: Int?,
+        total: Int?,
+        message: String?,
+    ) {
+        repo.updateEntryProgress(entryId, status, stage, current, total, message, null)
+        postProgressNotification(entryId, stage, current, total, message)
+    }
+
+    private fun postProgressNotification(
+        entryId: String,
+        stage: String?,
+        current: Int?,
+        total: Int?,
+        message: String?,
+    ) {
+        NotificationUtil.ensureChannel(applicationContext)
+        val title = "Summary of Slides"
+        val text =
+            when {
+                current != null && total != null && message != null -> "$message（$current/$total）"
+                message != null -> message
+                stage != null -> stage
+                else -> "处理中"
+            }
+        val notification =
+            NotificationUtil.buildProgressNotification(
+                context = applicationContext,
+                title = title,
+                text = text,
+            ).build()
+        val nm = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        runCatching { nm.notify(entryId.hashCode(), notification) }
+    }
+
+    private fun clearProgressNotification(entryId: String) {
+        val nm = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        runCatching { nm.cancel(entryId.hashCode()) }
+    }
+}
