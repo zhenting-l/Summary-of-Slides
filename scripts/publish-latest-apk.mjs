@@ -12,6 +12,30 @@ function getToken() {
   return token
 }
 
+async function resolveReleaseApk(repoRoot) {
+  const releaseDir = path.join(repoRoot, 'app', 'build', 'outputs', 'apk', 'release')
+  const dirEntries = await fs.readdir(releaseDir, { withFileTypes: true }).catch(() => null)
+  if (!dirEntries) {
+    throw new Error(`Release APK directory not found: ${releaseDir}`)
+  }
+
+  const apkFiles = dirEntries
+    .filter(entry => entry.isFile() && entry.name.toLowerCase().endsWith('.apk'))
+    .map(entry => path.join(releaseDir, entry.name))
+
+  if (apkFiles.length === 0) {
+    const names = dirEntries.map(entry => entry.name).join(', ')
+    throw new Error(`No APK found under ${releaseDir}. Existing files: ${names || '(empty)'}`)
+  }
+
+  const preferred =
+    apkFiles.find(file => path.basename(file) === 'app-release.apk') ||
+    apkFiles.find(file => !path.basename(file).includes('unsigned')) ||
+    apkFiles[0]
+
+  return preferred
+}
+
 async function getVersionName(repoRoot) {
   const gradleProperties = await fs.readFile(path.join(repoRoot, 'gradle.properties'), 'utf8')
   const match = gradleProperties.match(/^APP_VERSION_NAME=(.+)$/m)
@@ -84,7 +108,7 @@ async function main() {
   const versionName = await getVersionName(repoRoot)
   const tag = `v${versionName}`
   const releaseApkName = `Summary-of-Slides-v${versionName}.apk`
-  const releaseApk = path.join(repoRoot, 'app', 'build', 'outputs', 'apk', 'release', 'app-release.apk')
+  const releaseApk = await resolveReleaseApk(repoRoot)
 
   let release
   try {
@@ -122,7 +146,7 @@ async function main() {
     contentType: 'application/vnd.android.package-archive',
   })
 
-  console.log(`Uploaded ${releaseApkName} to release tag ${tag}`)
+  console.log(`Uploaded ${releaseApkName} from ${path.basename(releaseApk)} to release tag ${tag}`)
 }
 
 await main()
