@@ -28,12 +28,16 @@ async function resolveReleaseApk(repoRoot) {
     throw new Error(`No APK found under ${releaseDir}. Existing files: ${names || '(empty)'}`)
   }
 
-  const preferred =
+  const signedApk =
     apkFiles.find(file => path.basename(file) === 'app-release.apk') ||
-    apkFiles.find(file => !path.basename(file).includes('unsigned')) ||
-    apkFiles[0]
+    apkFiles.find(file => !path.basename(file).toLowerCase().includes('unsigned'))
 
-  return preferred
+  if (!signedApk) {
+    const fileNames = apkFiles.map(file => path.basename(file)).join(', ')
+    throw new Error(`Only unsigned APKs were found under ${releaseDir}: ${fileNames}`)
+  }
+
+  return signedApk
 }
 
 async function getVersionName(repoRoot) {

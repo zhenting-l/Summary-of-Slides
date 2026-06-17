@@ -58,6 +58,8 @@ jobs:
         run: |
           chmod +x ./gradlew
           ./gradlew assembleRelease --no-daemon
+          ls -lah app/build/outputs/apk/release
+          test -f app/build/outputs/apk/release/app-release.apk
 
       - name: Publish GitHub Release APK
         run: node scripts/publish-latest-apk.mjs
