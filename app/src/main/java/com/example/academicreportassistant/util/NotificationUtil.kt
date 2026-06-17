@@ -7,17 +7,35 @@ import android.os.Build
 import androidx.core.app.NotificationCompat
 
 object NotificationUtil {
-    const val ChannelId = "analysis_progress"
+    const val ProgressChannelId = "progress"
+    const val DailyChannelId = "daily_report"
 
     fun ensureChannel(context: Context) {
+        ensureProgressChannel(context)
+    }
+
+    fun ensureProgressChannel(context: Context) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        if (nm.getNotificationChannel(ChannelId) != null) return
+        if (nm.getNotificationChannel(ProgressChannelId) != null) return
         nm.createNotificationChannel(
             NotificationChannel(
-                ChannelId,
-                "Summary of Slides",
+                ProgressChannelId,
+                "处理进度",
                 NotificationManager.IMPORTANCE_LOW,
+            ),
+        )
+    }
+
+    fun ensureDailyChannel(context: Context) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (nm.getNotificationChannel(DailyChannelId) != null) return
+        nm.createNotificationChannel(
+            NotificationChannel(
+                DailyChannelId,
+                "优化论文日报",
+                NotificationManager.IMPORTANCE_DEFAULT,
             ),
         )
     }
@@ -26,10 +44,13 @@ object NotificationUtil {
         context: Context,
         title: String,
         text: String,
-    ) = NotificationCompat.Builder(context, ChannelId)
-        .setSmallIcon(android.R.drawable.stat_sys_upload)
-        .setContentTitle(title)
-        .setContentText(text)
-        .setOngoing(true)
-        .setOnlyAlertOnce(true)
+    ): NotificationCompat.Builder {
+        return NotificationCompat.Builder(context, ProgressChannelId)
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+    }
 }

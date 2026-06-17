@@ -6,7 +6,7 @@ plugins {
 }
 
 android {
-    namespace = "com.lzt.summaryofslides"
+    namespace = "com.example.academicreportassistant"
     compileSdk = 34
     val appVersionCode = (project.findProperty("APP_VERSION_CODE") as String?)?.toIntOrNull() ?: 1
     val appVersionName = (project.findProperty("APP_VERSION_NAME") as String?) ?: "1.0"
@@ -21,7 +21,7 @@ android {
             !releaseKeyPassword.isNullOrBlank()
 
     defaultConfig {
-        applicationId = "com.lzt.summaryofslides"
+        applicationId = "com.example.academicreportassistant"
         minSdk = 26
         targetSdk = 34
         versionCode = appVersionCode
@@ -56,6 +56,18 @@ android {
 
     buildFeatures {
         compose = true
+    }
+
+    sourceSets {
+        getByName("main") {
+            java.setSrcDirs(
+                listOf(
+                    "src/main/java/com/example/academicreportassistant",
+                    "src/main/java/com/lzt/summaryofslides/daily",
+                    "src/main/java/com/lzt/summaryofslides/ui/daily",
+                ),
+            )
+        }
     }
 
     composeOptions {
