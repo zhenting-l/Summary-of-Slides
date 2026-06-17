@@ -37,6 +37,7 @@ class OpenAiCompatClient(
         temperature: Double = 0.2,
         topP: Double? = null,
         maxTokens: Int? = null,
+        responseFormatJsonObject: Boolean = false,
     ): String {
         val b64 = Base64.encodeToString(jpegBytes, Base64.NO_WRAP)
         val dataUrl = "data:image/jpeg;base64,$b64"
@@ -49,6 +50,7 @@ class OpenAiCompatClient(
             temperature = temperature,
             topP = topP,
             maxTokens = maxTokens,
+            responseFormatJsonObject = responseFormatJsonObject,
         )
     }
 
@@ -61,6 +63,7 @@ class OpenAiCompatClient(
         temperature: Double = 0.2,
         topP: Double? = null,
         maxTokens: Int? = null,
+        responseFormatJsonObject: Boolean = false,
     ): String {
         val urls =
             jpegBytesList.map { bytes ->
@@ -76,6 +79,7 @@ class OpenAiCompatClient(
             temperature = temperature,
             topP = topP,
             maxTokens = maxTokens,
+            responseFormatJsonObject = responseFormatJsonObject,
         )
     }
 
@@ -88,6 +92,7 @@ class OpenAiCompatClient(
         temperature: Double,
         topP: Double?,
         maxTokens: Int?,
+        responseFormatJsonObject: Boolean,
     ): String {
         val body = buildChatCompletionBody(
             model = model,
@@ -123,6 +128,7 @@ class OpenAiCompatClient(
             temperature = temperature,
             topP = topP,
             maxTokens = maxTokens,
+            responseFormatJsonObject = responseFormatJsonObject,
         )
         return postForAssistantText(baseUrl, apiKey, body)
     }
@@ -135,6 +141,7 @@ class OpenAiCompatClient(
         temperature: Double = 0.2,
         topP: Double? = null,
         maxTokens: Int? = null,
+        responseFormatJsonObject: Boolean = false,
     ): String {
         val body = buildChatCompletionBody(
             model = model,
@@ -149,6 +156,7 @@ class OpenAiCompatClient(
             temperature = temperature,
             topP = topP,
             maxTokens = maxTokens,
+            responseFormatJsonObject = responseFormatJsonObject,
         )
         return postForAssistantText(baseUrl, apiKey, body)
     }
@@ -159,6 +167,7 @@ class OpenAiCompatClient(
         temperature: Double,
         topP: Double?,
         maxTokens: Int?,
+        responseFormatJsonObject: Boolean,
     ): JsonObject {
         return buildJsonObject {
             put("model", JsonPrimitive(model))
@@ -166,6 +175,14 @@ class OpenAiCompatClient(
             put("temperature", JsonPrimitive(temperature))
             if (topP != null) put("top_p", JsonPrimitive(topP))
             if (maxTokens != null) put("max_tokens", JsonPrimitive(maxTokens))
+            if (responseFormatJsonObject) {
+                put(
+                    "response_format",
+                    buildJsonObject {
+                        put("type", JsonPrimitive("json_object"))
+                    },
+                )
+            }
         }
     }
 

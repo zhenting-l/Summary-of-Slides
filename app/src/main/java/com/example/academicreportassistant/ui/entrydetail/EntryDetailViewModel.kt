@@ -86,7 +86,7 @@ class EntryDetailViewModel(private val entryId: String) : ViewModel() {
     fun startAnalysis(
         context: Context,
         extraPrompt: String? = null,
-        batchImages: Boolean = false,
+        batchImages: Boolean = true,
         incremental: Boolean = false,
     ) {
         viewModelScope.launch {

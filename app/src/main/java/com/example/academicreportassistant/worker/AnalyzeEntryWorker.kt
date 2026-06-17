@@ -51,7 +51,7 @@ class AnalyzeEntryWorker(
         val llm = OpenAiCompatClient()
         val json = Json { ignoreUnknownKeys = true; isLenient = true }
         val extraPrompt = inputData.getString("extraPrompt")?.trim()?.takeIf { it.isNotBlank() }
-        val batchImages = inputData.getBoolean("batchImages", false)
+        val batchImages = inputData.getBoolean("batchImages", true)
         val incremental = inputData.getBoolean("incremental", false)
 
         try {
@@ -324,6 +324,11 @@ class AnalyzeEntryWorker(
         val slideNames: Map<Int, String>,
     )
 
+    private data class ParsedBatchSlide(
+        val pageIndex: Int,
+        val extractedJson: String,
+    )
+
     private fun parseSummaryPayload(json: Json, raw: String): SummaryPayload {
         val jsonString = extractJsonBlock(raw) ?: raw
         val root = runCatching { json.parseToJsonElement(jsonString).jsonObject }.getOrNull()
@@ -380,80 +385,24 @@ class AnalyzeEntryWorker(
         val newAnalyses = mutableListOf<SlideAnalysisEntity>()
         if (newItems.isNotEmpty()) {
             if (batchImages && newItems.size >= 2) {
-                val groups = newItems.chunked(4)
+                val groups = newItems.chunked(stableVisionBatchSize)
                 for ((gIdx, group) in groups.withIndex()) {
-                    val gCurrent = gIdx + 1
-                    val pages = group.map { it.first }
-                    updateProgress(repo, entryId, "PROCESSING", "PREPARE_IMAGE", gCurrent, groups.size, "准备图片（批量组 $gCurrent/${groups.size}）")
-                    val bytesList = mutableListOf<ByteArray>()
-                    for ((idx, item) in group.withIndex()) {
-                        val current = idx + 1
-                        updateProgress(repo, entryId, "PROCESSING", "PREPARE_IMAGE", current, group.size, "压缩图片（$current/${group.size}）")
-                        val bytes =
-                            item.second.jpegBytes
-                                ?: withContext(Dispatchers.IO) { ImageTranscodeUtil.loadAndCompressJpeg(File(item.second.entity.localPath)) }
-                        bytesList += bytes
-                    }
-                    val prompt = withExtraPrompt(slidePromptBatch(pages), extraPrompt)
-                    updateProgress(repo, entryId, "PROCESSING", "CALL_VISION", gCurrent, groups.size, "调用视觉模型（批量组 $gCurrent/${groups.size}）")
-                    val content =
-                        llm.visionChatCompletionWithJpegBytesList(
+                    newAnalyses +=
+                        analyzeBatchGroup(
+                            repo = repo,
+                            llm = llm,
+                            json = json,
+                            entryId = entryId,
                             baseUrl = baseUrl,
                             apiKey = apiKey,
-                            model = visionModel,
-                            prompt = prompt,
-                            jpegBytesList = bytesList,
-                            temperature = 0.1,
-                            topP = 0.7,
-                            maxTokens = 4096,
+                            group = group,
+                            visionModel = visionModel,
+                            generalModel = generalModel,
+                            extraPrompt = extraPrompt,
+                            topLevelGroupCurrent = gIdx + 1,
+                            topLevelGroupTotal = groups.size,
+                            totalImageCount = imagesForAnalysis.size,
                         )
-                    val parsed = parseBatchSlideJson(json, content)
-                    val batchOk = parsed.isNotEmpty() && parsed.size == group.size
-                    if (batchOk) {
-                        for ((idx, item) in parsed.withIndex()) {
-                            val (page, img) = group.getOrNull(idx) ?: continue
-                            newAnalyses +=
-                                SlideAnalysisEntity(
-                                    id = UUID.randomUUID().toString(),
-                                    entryId = entryId,
-                                    imageId = img.entity.id,
-                                    extractedJson = item,
-                                    extractedText = null,
-                                    createdAtEpochMs = System.currentTimeMillis() + page,
-                                )
-                        }
-                    } else {
-                        updateProgress(repo, entryId, "PROCESSING", "FALLBACK", null, null, "批量解析失败，回退为逐页解析")
-                        for ((page, img) in group) {
-                            updateProgress(repo, entryId, "PROCESSING", "PREPARE_IMAGE", page, imagesForAnalysis.size, "第 $page 页：准备图片")
-                            val bytes =
-                                img.jpegBytes
-                                    ?: withContext(Dispatchers.IO) { ImageTranscodeUtil.loadAndCompressJpeg(File(img.entity.localPath)) }
-                            val p = withExtraPrompt(slidePrompt(page), extraPrompt)
-                            updateProgress(repo, entryId, "PROCESSING", "CALL_VISION", page, imagesForAnalysis.size, "第 $page 页：调用视觉模型")
-                            val c =
-                                llm.visionChatCompletion(
-                                    baseUrl = baseUrl,
-                                    apiKey = apiKey,
-                                    model = visionModel,
-                                    prompt = p,
-                                    jpegBytes = bytes,
-                                    temperature = 0.1,
-                                    topP = 0.7,
-                                    maxTokens = 4096,
-                                )
-                            updateProgress(repo, entryId, "PROCESSING", "PARSE_VISION", page, imagesForAnalysis.size, "第 $page 页：保存解析结果")
-                            newAnalyses +=
-                                SlideAnalysisEntity(
-                                    id = UUID.randomUUID().toString(),
-                                    entryId = entryId,
-                                    imageId = img.entity.id,
-                                    extractedJson = c,
-                                    extractedText = null,
-                                    createdAtEpochMs = System.currentTimeMillis(),
-                                )
-                        }
-                    }
                 }
             } else {
                 for ((page, img) in newItems) {
@@ -542,6 +491,267 @@ class AnalyzeEntryWorker(
 
     private val finalSummaryMaxTokens = 16384
     private val chunkAnalysisMaxTokens = 6144
+    private val stableVisionBatchSize = 4
+    private val maxBatchRepairAttempts = 2
+
+    private suspend fun analyzeBatchGroup(
+        repo: com.lzt.summaryofslides.data.repo.EntryRepository,
+        llm: OpenAiCompatClient,
+        json: Json,
+        entryId: String,
+        baseUrl: String,
+        apiKey: String,
+        group: List<Pair<Int, ImageForAnalysis>>,
+        visionModel: String,
+        generalModel: String,
+        extraPrompt: String?,
+        topLevelGroupCurrent: Int,
+        topLevelGroupTotal: Int,
+        totalImageCount: Int,
+    ): List<SlideAnalysisEntity> {
+        val pages = group.map { it.first }
+        updateProgress(
+            repo,
+            entryId,
+            "PROCESSING",
+            "PREPARE_IMAGE",
+            topLevelGroupCurrent,
+            topLevelGroupTotal,
+            "准备图片（批量组 $topLevelGroupCurrent/$topLevelGroupTotal，${group.size}张）",
+        )
+        val bytesList = mutableListOf<ByteArray>()
+        for ((idx, item) in group.withIndex()) {
+            val current = idx + 1
+            updateProgress(repo, entryId, "PROCESSING", "PREPARE_IMAGE", current, group.size, "压缩图片（$current/${group.size}）")
+            val bytes =
+                item.second.jpegBytes
+                    ?: withContext(Dispatchers.IO) { ImageTranscodeUtil.loadAndCompressJpeg(File(item.second.entity.localPath)) }
+            bytesList += bytes
+        }
+
+        val prompt = withExtraPrompt(slidePromptBatch(pages), extraPrompt)
+        repeat(maxBatchRepairAttempts) { attempt ->
+            val currentAttempt = attempt + 1
+            updateProgress(
+                repo,
+                entryId,
+                "PROCESSING",
+                "CALL_VISION",
+                topLevelGroupCurrent,
+                topLevelGroupTotal,
+                "调用视觉模型（批量组 $topLevelGroupCurrent/$topLevelGroupTotal，第${currentAttempt}次）",
+            )
+            val content =
+                llm.visionChatCompletionWithJpegBytesList(
+                    baseUrl = baseUrl,
+                    apiKey = apiKey,
+                    model = visionModel,
+                    prompt = prompt,
+                    jpegBytesList = bytesList,
+                    temperature = 0.1,
+                    topP = 0.7,
+                    maxTokens = 4096,
+                    responseFormatJsonObject = true,
+                )
+            val parsed = parseBatchSlideJson(json, content, expectedPages = pages)
+            if (parsed != null) {
+                updateProgress(repo, entryId, "PROCESSING", "PARSE_VISION", topLevelGroupCurrent, topLevelGroupTotal, "批量结果校验通过")
+                return parsed.mapNotNull { item ->
+                    val img = group.firstOrNull { it.first == item.pageIndex }?.second ?: return@mapNotNull null
+                    buildSlideAnalysisEntity(entryId, img.entity.id, item.extractedJson, item.pageIndex)
+                }
+            }
+            updateProgress(
+                repo,
+                entryId,
+                "PROCESSING",
+                "PARSE_VISION",
+                currentAttempt,
+                maxBatchRepairAttempts,
+                "批量结果结构不完整，尝试修复（$currentAttempt/$maxBatchRepairAttempts）",
+            )
+            val repaired =
+                repairBatchSlideJson(
+                    llm = llm,
+                    json = json,
+                    baseUrl = baseUrl,
+                    apiKey = apiKey,
+                    generalModel = generalModel,
+                    expectedPages = pages,
+                    raw = content,
+                )
+            if (repaired != null) {
+                updateProgress(repo, entryId, "PROCESSING", "PARSE_VISION", topLevelGroupCurrent, topLevelGroupTotal, "批量结果修复成功")
+                return repaired.mapNotNull { item ->
+                    val img = group.firstOrNull { it.first == item.pageIndex }?.second ?: return@mapNotNull null
+                    buildSlideAnalysisEntity(entryId, img.entity.id, item.extractedJson, item.pageIndex)
+                }
+            }
+        }
+
+        if (group.size > 2) {
+            val splitIndex = group.size / 2
+            val left = group.take(splitIndex)
+            val right = group.drop(splitIndex)
+            updateProgress(
+                repo,
+                entryId,
+                "PROCESSING",
+                "FALLBACK",
+                topLevelGroupCurrent,
+                topLevelGroupTotal,
+                "批量结果仍不稳定，拆分为 ${left.size}+${right.size} 继续批处理",
+            )
+            return analyzeBatchGroup(
+                repo = repo,
+                llm = llm,
+                json = json,
+                entryId = entryId,
+                baseUrl = baseUrl,
+                apiKey = apiKey,
+                group = left,
+                visionModel = visionModel,
+                generalModel = generalModel,
+                extraPrompt = extraPrompt,
+                topLevelGroupCurrent = topLevelGroupCurrent,
+                topLevelGroupTotal = topLevelGroupTotal,
+                totalImageCount = totalImageCount,
+            ) +
+                analyzeBatchGroup(
+                    repo = repo,
+                    llm = llm,
+                    json = json,
+                    entryId = entryId,
+                    baseUrl = baseUrl,
+                    apiKey = apiKey,
+                    group = right,
+                    visionModel = visionModel,
+                    generalModel = generalModel,
+                    extraPrompt = extraPrompt,
+                    topLevelGroupCurrent = topLevelGroupCurrent,
+                    topLevelGroupTotal = topLevelGroupTotal,
+                    totalImageCount = totalImageCount,
+                )
+        }
+
+        updateProgress(repo, entryId, "PROCESSING", "FALLBACK", null, null, "双图批处理仍失败，最后回退为逐页解析")
+        return group.map { (page, img) ->
+            analyzeSingleImage(
+                repo = repo,
+                llm = llm,
+                entryId = entryId,
+                baseUrl = baseUrl,
+                apiKey = apiKey,
+                page = page,
+                img = img,
+                visionModel = visionModel,
+                extraPrompt = extraPrompt,
+                totalImageCount = totalImageCount,
+            )
+        }
+    }
+
+    private suspend fun repairBatchSlideJson(
+        llm: OpenAiCompatClient,
+        json: Json,
+        baseUrl: String,
+        apiKey: String,
+        generalModel: String,
+        expectedPages: List<Int>,
+        raw: String,
+    ): List<ParsedBatchSlide>? {
+        val pages = expectedPages.joinToString(", ")
+        val prompt =
+            """
+你将收到一段来自多图幻灯片解析任务的原始输出，它可能不是合法JSON，或字段结构不稳定。请不要补造原文中没有的信息，只把已有信息整理成严格JSON对象：
+{
+  "slides": [
+    {
+      "page_index": 1,
+      "section": "",
+      "main_points": [],
+      "methods": [],
+      "equations": [],
+      "figures": [],
+      "citations": [],
+      "terms": [],
+      "raw_text": ""
+    }
+  ]
+}
+
+要求：
+1. 只输出JSON对象，不要输出解释
+2. slides 数量必须等于 ${expectedPages.size}
+3. page_index 必须且只能使用这些页码：$pages
+4. 缺失字段用空字符串或空数组
+5. 不允许新增额外字段
+
+原始输出如下：
+${raw.take(32_000)}
+""".trimIndent()
+        val repaired =
+            llm.textChatCompletion(
+                baseUrl = baseUrl,
+                apiKey = apiKey,
+                model = generalModel,
+                prompt = prompt,
+                temperature = 0.0,
+                maxTokens = 4096,
+                responseFormatJsonObject = true,
+            )
+        return parseBatchSlideJson(json, repaired, expectedPages = expectedPages)
+    }
+
+    private suspend fun analyzeSingleImage(
+        repo: com.lzt.summaryofslides.data.repo.EntryRepository,
+        llm: OpenAiCompatClient,
+        entryId: String,
+        baseUrl: String,
+        apiKey: String,
+        page: Int,
+        img: ImageForAnalysis,
+        visionModel: String,
+        extraPrompt: String?,
+        totalImageCount: Int,
+    ): SlideAnalysisEntity {
+        updateProgress(repo, entryId, "PROCESSING", "PREPARE_IMAGE", page, totalImageCount, "第 $page 页：准备图片")
+        val bytes =
+            img.jpegBytes
+                ?: withContext(Dispatchers.IO) { ImageTranscodeUtil.loadAndCompressJpeg(File(img.entity.localPath)) }
+        val prompt = withExtraPrompt(slidePrompt(page), extraPrompt)
+        updateProgress(repo, entryId, "PROCESSING", "CALL_VISION", page, totalImageCount, "第 $page 页：调用视觉模型")
+        val content =
+            llm.visionChatCompletion(
+                baseUrl = baseUrl,
+                apiKey = apiKey,
+                model = visionModel,
+                prompt = prompt,
+                jpegBytes = bytes,
+                temperature = 0.1,
+                topP = 0.7,
+                maxTokens = 4096,
+                responseFormatJsonObject = true,
+            )
+        updateProgress(repo, entryId, "PROCESSING", "PARSE_VISION", page, totalImageCount, "第 $page 页：保存解析结果")
+        return buildSlideAnalysisEntity(entryId, img.entity.id, content, page)
+    }
+
+    private fun buildSlideAnalysisEntity(
+        entryId: String,
+        imageId: String,
+        extractedJson: String,
+        page: Int,
+    ): SlideAnalysisEntity {
+        return SlideAnalysisEntity(
+            id = UUID.randomUUID().toString(),
+            entryId = entryId,
+            imageId = imageId,
+            extractedJson = extractedJson,
+            extractedText = null,
+            createdAtEpochMs = System.currentTimeMillis() + page,
+        )
+    }
 
     private fun detailedFinalSummaryInstruction(): String {
         return "详版总结正文（Markdown）。内容必须充分展开，不要只写成几句短摘要，也不要只给稀疏提纲。若材料信息充足，请优先写成较完整的研究笔记/论文解读，通常应达到 1200-3000 字以上，并尽量覆盖：1. 研究背景与问题定义 2. 核心思想总览 3. 方法/模型/算法细节 4. 关键公式与符号解释 5. 实验设置、评价指标与结果分析 6. 局限性、失败模式与可改进方向 7. 结论与个人启发。对于关键方法，必须解释其输入输出、模块组成、信息流、训练或推理步骤；对于关键思想，不要只复述结论，要说明“为什么这样设计”。对于关键公式，若原文出现了目标函数、损失函数、概率分布、优化问题、更新规则、注意力计算、复杂度表达式等，优先保留原公式，并紧接着用自然语言解释各符号、各项的含义、公式想表达的机制以及它和全文方法的关系。final_summary 必须是合法JSON字符串：换行请用 \\n，双引号请用 \\\"。数学公式使用LaTeX：块级公式用${'$'}${'$'}在独立行包裹（即${'$'}${'$'}\\n...\\n${'$'}${'$'}），行内公式用${'$'}...${'$'}且必须同一行闭合（不要在${'$'}...${'$'}中换行）。涉及上下标时使用^和_并配合大括号：x_{k}, x^{k}, x^{*}。数学环境内标点用半角(, . ; :)。不要用反引号或代码块包裹公式。为避免解析失败，不要使用Markdown表格（|---|），用标题+列表/段落表达。不要输出思维链，不要输出JSON以外的任何文本。"
@@ -723,35 +933,54 @@ $joined
     private fun slidePromptBatch(pages: List<Int>): String {
         val p = pages.joinToString(", ")
         return """
-你将收到多张幻灯片图片（页码分别为：$p）。请按图片顺序输出严格JSON数组（不要包含除JSON以外的任何文本），数组每个元素结构与单页相同：
+你将收到多张幻灯片图片（页码分别为：$p）。请综合所有图片后，只输出一个严格JSON对象（不要输出Markdown代码块，也不要输出解释），结构如下：
 {
-  "page_index": 1,
-  "section": "本页所属章节/主题(可空)",
-  "main_points": ["要点1","要点2"],
-  "methods": ["方法/模型/算法(可空)"],
-  "equations": ["公式/符号解释(可空)。必须输出可编译的LaTeX（不要加${'$'}或${'$'}${'$'}）。上下标必须用^/_并配合花括号：x_{k}, x^{k}, x^{*}。算子必须带反斜杠：\\sin, \\log, \\max, \\arg\\min, \\det。偏导用\\partial，梯度用\\nabla，分数用\\frac。多行对齐公式用\\begin{aligned}...\\end{aligned}并用\\\\换行、&对齐。"],
-  "figures": ["图表/示意图描述(可空)"],
-  "citations": ["出现的论文/作者/会议期刊/DOI/链接线索(可空)"],
-  "terms": ["术语及简短解释(可空)"],
-  "raw_text": "尽可能完整的可读文本(可空)"
+  "slides": [
+    {
+      "page_index": 1,
+      "section": "本页所属章节/主题(可空)",
+      "main_points": ["要点1","要点2"],
+      "methods": ["方法/模型/算法(可空)"],
+      "equations": ["公式/符号解释(可空)。必须输出可编译的LaTeX（不要加${'$'}或${'$'}${'$'}）。上下标必须用^/_并配合花括号：x_{k}, x^{k}, x^{*}。算子必须带反斜杠：\\sin, \\log, \\max, \\arg\\min, \\det。偏导用\\partial，梯度用\\nabla，分数用\\frac。多行对齐公式用\\begin{aligned}...\\end{aligned}并用\\\\换行、&对齐。"],
+      "figures": ["图表/示意图描述(可空)"],
+      "citations": ["出现的论文/作者/会议期刊/DOI/链接线索(可空)"],
+      "terms": ["术语及简短解释(可空)"],
+      "raw_text": "尽可能完整的可读文本(可空)"
+    }
+  ]
 }
 
 要求：
-1) JSON数组长度必须等于图片数量（${pages.size}）
-2) 每个元素的 page_index 必须与对应图片页码一致（按顺序分别为：$p）
+1) 必须返回 JSON 对象，顶层只允许有一个字段 "slides"
+2) slides 数组长度必须等于图片数量（${pages.size}）
+3) 每个元素的 page_index 必须与对应图片页码一致，且一一对应（页码集合：$p）
+4) 即使某一页信息较少，也必须保留该页对象，缺失字段用空字符串或空数组
+5) 不要遗漏任何图片，不要合并多页内容到同一个对象
 """.trimIndent()
     }
 
-    private fun parseBatchSlideJson(json: Json, raw: String): List<String> {
-        val block = extractJsonArrayBlock(raw) ?: raw
-        val el = runCatching { json.parseToJsonElement(block) }.getOrNull() ?: return emptyList()
+    private fun parseBatchSlideJson(json: Json, raw: String, expectedPages: List<Int>): List<ParsedBatchSlide>? {
+        val block = extractJsonBlock(raw) ?: extractJsonArrayBlock(raw) ?: raw
+        val el = runCatching { json.parseToJsonElement(block) }.getOrNull() ?: return null
         val arr =
             (el as? kotlinx.serialization.json.JsonArray)
+                ?: el.jsonObjectOrNull()?.get("slides")?.jsonArray
                 ?: (el.jsonObjectOrNull()
                     ?.values
                     ?.firstOrNull { it is kotlinx.serialization.json.JsonArray } as? kotlinx.serialization.json.JsonArray)
-                ?: return emptyList()
-        return arr.map { it.toString() }
+                ?: return null
+        if (arr.size != expectedPages.size) return null
+        val byPage =
+            arr.mapNotNull { item ->
+                val obj = item.jsonObjectOrNull() ?: return@mapNotNull null
+                val pageIndex = obj["page_index"]?.intOrNull() ?: return@mapNotNull null
+                pageIndex to obj.toString()
+            }.toMap()
+        if (byPage.size != expectedPages.size) return null
+        if (byPage.keys != expectedPages.toSet()) return null
+        return expectedPages.mapNotNull { page ->
+            byPage[page]?.let { ParsedBatchSlide(pageIndex = page, extractedJson = it) }
+        }.takeIf { it.size == expectedPages.size }
     }
 
     private fun extractJsonArrayBlock(text: String): String? {

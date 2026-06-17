@@ -87,7 +87,7 @@ fun EntryDetailScreen(
     var showExtraPromptDialog by remember { mutableStateOf(false) }
     var continuousCapture by remember { mutableStateOf(false) }
     var showAnalysisOptionsDialog by remember { mutableStateOf(false) }
-    var batchImages by remember { mutableStateOf(false) }
+    var batchImages by remember { mutableStateOf(true) }
 
     val takePictureLauncherRef =
         remember { mutableStateOf<ManagedActivityResultLauncher<Uri, Boolean>?>(null) }

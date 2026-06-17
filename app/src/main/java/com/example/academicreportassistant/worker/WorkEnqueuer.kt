@@ -28,7 +28,7 @@ object WorkEnqueuer {
         entryId: String,
         source: String? = null,
         extraPrompt: String? = null,
-        batchImages: Boolean = false,
+        batchImages: Boolean = true,
         incremental: Boolean = false,
     ) {
         val constraints =
