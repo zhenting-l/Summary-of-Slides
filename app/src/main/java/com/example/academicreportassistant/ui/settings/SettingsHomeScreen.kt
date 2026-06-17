@@ -20,7 +20,6 @@ fun SettingsHomeScreen(
     onBack: () -> Unit,
     onOpenModelSettings: () -> Unit,
     onOpenAbout: () -> Unit,
-    onOpenDaily: () -> Unit,
 ) {
     Scaffold(
         topBar = {
@@ -48,12 +47,6 @@ fun SettingsHomeScreen(
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Text("关于 Summary of Slides")
-            }
-            Button(
-                onClick = onOpenDaily,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text("优化论文日报（手机端）")
             }
         }
     }

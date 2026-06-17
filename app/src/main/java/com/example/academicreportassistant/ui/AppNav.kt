@@ -32,10 +32,6 @@ object Routes {
     const val Settings = "settings"
     const val SettingsModel = "settings_model"
     const val SettingsAbout = "settings_about"
-    const val DailyHome = "daily_home"
-    const val DailyHistory = "daily_history"
-    const val DailyReport = "daily_report"
-    const val DailySettings = "daily_settings"
 }
 
 @Composable
@@ -122,7 +118,6 @@ fun AppNav() {
                 onBack = { navController.popBackStack() },
                 onOpenModelSettings = { navController.navigate(Routes.SettingsModel) },
                 onOpenAbout = { navController.navigate(Routes.SettingsAbout) },
-                onOpenDaily = { navController.navigate(Routes.DailyHome) },
             )
         }
         composable(Routes.SettingsModel) {
@@ -130,39 +125,6 @@ fun AppNav() {
         }
         composable(Routes.SettingsAbout) {
             AboutScreen(onBack = { navController.popBackStack() })
-        }
-
-        composable(Routes.DailyHome) {
-            com.lzt.summaryofslides.ui.daily.DailyHomeScreen(
-                onBack = { navController.popBackStack() },
-                onOpenHistory = { navController.navigate(Routes.DailyHistory) },
-                onOpenSettings = { navController.navigate(Routes.DailySettings) },
-                onOpenReport = { date -> navController.navigate("${Routes.DailyReport}/$date") },
-            )
-        }
-
-        composable(Routes.DailyHistory) {
-            com.lzt.summaryofslides.ui.daily.DailyHistoryScreen(
-                onBack = { navController.popBackStack() },
-                onOpenReport = { date -> navController.navigate("${Routes.DailyReport}/$date") },
-            )
-        }
-
-        composable(
-            route = "${Routes.DailyReport}/{reportDate}",
-            arguments = listOf(navArgument("reportDate") { type = NavType.StringType }),
-        ) { backStackEntry ->
-            val reportDate = requireNotNull(backStackEntry.arguments?.getString("reportDate"))
-            com.lzt.summaryofslides.ui.daily.DailyReportScreen(
-                reportDate = reportDate,
-                onBack = { navController.popBackStack() },
-            )
-        }
-
-        composable(Routes.DailySettings) {
-            com.lzt.summaryofslides.ui.daily.DailySettingsScreen(
-                onBack = { navController.popBackStack() },
-            )
         }
     }
 }

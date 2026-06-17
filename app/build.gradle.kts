@@ -58,13 +58,12 @@ android {
         compose = true
     }
 
+    // Compile only the current Android app source tree and exclude archived legacy sources.
     sourceSets {
         getByName("main") {
             java.setSrcDirs(
                 listOf(
                     "src/main/java/com/example/academicreportassistant",
-                    "src/main/java/com/lzt/summaryofslides/daily",
-                    "src/main/java/com/lzt/summaryofslides/ui/daily",
                 ),
             )
         }

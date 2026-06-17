@@ -8,7 +8,6 @@ import androidx.core.app.NotificationCompat
 
 object NotificationUtil {
     const val ProgressChannelId = "progress"
-    const val DailyChannelId = "daily_report"
 
     fun ensureChannel(context: Context) {
         ensureProgressChannel(context)
@@ -23,19 +22,6 @@ object NotificationUtil {
                 ProgressChannelId,
                 "处理进度",
                 NotificationManager.IMPORTANCE_LOW,
-            ),
-        )
-    }
-
-    fun ensureDailyChannel(context: Context) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
-        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        if (nm.getNotificationChannel(DailyChannelId) != null) return
-        nm.createNotificationChannel(
-            NotificationChannel(
-                DailyChannelId,
-                "优化论文日报",
-                NotificationManager.IMPORTANCE_DEFAULT,
             ),
         )
     }

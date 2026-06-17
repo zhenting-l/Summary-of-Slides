@@ -4,8 +4,6 @@ import android.content.Context
 import androidx.room.Room
 import com.lzt.summaryofslides.data.db.AppDatabase
 import com.lzt.summaryofslides.data.repo.EntryRepository
-import com.lzt.summaryofslides.daily.DailyRepository
-import com.lzt.summaryofslides.daily.DailySettingsStore
 import com.lzt.summaryofslides.settings.SettingsStore
 
 object AppContainer {
@@ -17,10 +15,6 @@ object AppContainer {
         private set
     lateinit var settingsStore: SettingsStore
         private set
-    lateinit var dailySettingsStore: DailySettingsStore
-        private set
-    lateinit var dailyRepository: DailyRepository
-        private set
 
     fun init(context: Context) {
         appContext = context.applicationContext
@@ -30,7 +24,5 @@ object AppContainer {
                 .fallbackToDestructiveMigration()
                 .build()
         entryRepository = EntryRepository(db, appContext)
-        dailySettingsStore = DailySettingsStore(appContext)
-        dailyRepository = DailyRepository(appContext)
     }
 }
