@@ -2,15 +2,23 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 
 const OWNER = 'zhenting-l'
-const REPO = 'dailyarxiv_sync'
-const TAG = 'latest-apk'
+const REPO = 'Summary-of-Slides'
 
 function getToken() {
-  const token = process.env.DAILYARXIV_GITHUB_TOKEN || process.env.GITHUB_TOKEN || process.env.GH_TOKEN
+  const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN
   if (!token) {
-    throw new Error('Missing GitHub token in env DAILYARXIV_GITHUB_TOKEN / GITHUB_TOKEN / GH_TOKEN')
+    throw new Error('Missing GitHub token in env GITHUB_TOKEN / GH_TOKEN')
   }
   return token
+}
+
+async function getVersionName(repoRoot) {
+  const gradleProperties = await fs.readFile(path.join(repoRoot, 'gradle.properties'), 'utf8')
+  const match = gradleProperties.match(/^APP_VERSION_NAME=(.+)$/m)
+  if (!match) {
+    throw new Error('APP_VERSION_NAME not found in gradle.properties')
+  }
+  return match[1].trim()
 }
 
 async function apiJson(method, url, { token, body } = {}) {
@@ -72,12 +80,33 @@ async function uploadAsset({ token, uploadUrlTemplate, filePath, name, contentTy
 
 async function main() {
   const token = getToken()
+  const repoRoot = process.cwd()
+  const versionName = await getVersionName(repoRoot)
+  const tag = `v${versionName}`
+  const releaseApkName = `Summary-of-Slides-v${versionName}.apk`
+  const releaseApk = path.join(repoRoot, 'app', 'build', 'outputs', 'apk', 'release', 'app-release.apk')
 
-  const release = await apiJson('GET', `https://api.github.com/repos/${OWNER}/${REPO}/releases/tags/${TAG}`, { token })
+  let release
+  try {
+    release = await apiJson('GET', `https://api.github.com/repos/${OWNER}/${REPO}/releases/tags/${tag}`, { token })
+  } catch (error) {
+    const message = String(error?.message || error)
+    if (!message.includes('404')) throw error
+    release = await apiJson('POST', `https://api.github.com/repos/${OWNER}/${REPO}/releases`, {
+      token,
+      body: {
+        tag_name: tag,
+        name: tag,
+        draft: false,
+        prerelease: false,
+        generate_release_notes: true,
+      },
+    })
+  }
   const uploadUrlTemplate = release.upload_url
 
   const existingAssets = Array.isArray(release.assets) ? release.assets : []
-  const namesToReplace = new Set(['app-debug.apk', 'app-release.apk'])
+  const namesToReplace = new Set(['app-release.apk', releaseApkName])
 
   for (const asset of existingAssets) {
     if (namesToReplace.has(asset.name)) {
@@ -85,27 +114,15 @@ async function main() {
     }
   }
 
-  const repoRoot = process.cwd()
-  const debugApk = path.join(repoRoot, 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk')
-  const releaseApk = path.join(repoRoot, 'app', 'build', 'outputs', 'apk', 'release', 'app-release.apk')
-
-  await uploadAsset({
-    token,
-    uploadUrlTemplate,
-    filePath: debugApk,
-    name: 'app-debug.apk',
-    contentType: 'application/vnd.android.package-archive',
-  })
-
   await uploadAsset({
     token,
     uploadUrlTemplate,
     filePath: releaseApk,
-    name: 'app-release.apk',
+    name: releaseApkName,
     contentType: 'application/vnd.android.package-archive',
   })
 
-  console.log(`Uploaded APKs to release tag ${TAG}`)
+  console.log(`Uploaded ${releaseApkName} to release tag ${tag}`)
 }
 
 await main()
