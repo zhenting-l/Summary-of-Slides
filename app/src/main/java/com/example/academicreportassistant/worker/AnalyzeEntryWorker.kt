@@ -933,7 +933,16 @@ $joined
     private fun slidePromptBatch(pages: List<Int>): String {
         val p = pages.joinToString(", ")
         return """
-你将收到多张幻灯片图片（页码分别为：$p）。请综合所有图片后，只输出一个严格JSON对象（不要输出Markdown代码块，也不要输出解释），结构如下：
+你将收到多张幻灯片图片（页码分别为：$p）。请综合所有图片后，只输出一个严格JSON对象。你的输出会被程序直接解析，因此必须把自己当作“只返回JSON的函数”，而不是聊天助手。
+
+禁止输出以下内容：
+- 禁止任何解释、开场白、结束语、备注、提示语
+- 禁止任何标题，如“批量分析结果”“下面是结果”
+- 禁止 Markdown 代码块，如 ```json
+- 禁止在 JSON 前后添加任何额外字符、前缀或后缀
+- 禁止省略页、禁止合并页、禁止改写页码
+
+必须只输出下面这个 JSON 对象，结构如下：
 {
   "slides": [
     {
@@ -956,6 +965,30 @@ $joined
 3) 每个元素的 page_index 必须与对应图片页码一致，且一一对应（页码集合：$p）
 4) 即使某一页信息较少，也必须保留该页对象，缺失字段用空字符串或空数组
 5) 不要遗漏任何图片，不要合并多页内容到同一个对象
+6) page_index 必须且只能出现这些值：[$p]
+7) slides 中每个元素都必须是 JSON 对象，不能是字符串、注释或自然语言段落
+8) main_points / methods / equations / figures / citations / terms 必须是 JSON 数组；section / raw_text 必须是字符串
+9) 如果你不确定某页内容，也必须输出该页对象；不要跳过该页，可用空字符串或空数组
+10) 输出前请自行静默检查：是否正好返回 ${pages.size} 个 slide 对象、页码是否完整覆盖 [$p]、是否没有任何 JSON 之外的文本
+
+错误示例（禁止这样输出）：
+- 下面是解析结果：{...}
+- ```json { ... } ```
+- 只返回 3 页而不是 ${pages.size} 页
+- 把第 2 页和第 3 页合并成一个对象
+
+如果某一页内容极少，正确做法是保留该页，例如：
+{
+  "page_index": 1,
+  "section": "",
+  "main_points": [],
+  "methods": [],
+  "equations": [],
+  "figures": [],
+  "citations": [],
+  "terms": [],
+  "raw_text": ""
+}
 """.trimIndent()
     }
 
