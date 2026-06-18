@@ -76,14 +76,14 @@ fun CameraCaptureScreen(
     var camera by remember { mutableStateOf<Camera?>(null) }
     var isCapturing by remember { mutableStateOf(false) }
     var capturedCount by remember { mutableStateOf(0) }
-    var statusMessage by remember { mutableStateOf("轻触取景区域可重新对焦，拍照后会停留在本页面") }
+    var statusMessage by remember { mutableStateOf("当前为 CameraX 清晰度优先模式，轻触取景区域可重新对焦") }
 
     val requestCameraPermission =
         rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             hasCameraPermission = granted
             statusMessage =
                 if (granted) {
-                    "相机已就绪，拍照后会继续停留在当前界面"
+                    "相机已就绪，当前按清晰度优先配置拍照"
                 } else {
                     "未授予相机权限，无法进入连续拍照"
                 }
@@ -110,7 +110,8 @@ fun CameraCaptureScreen(
                         }
                     val capture =
                         ImageCapture.Builder()
-                            .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                            .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
+                            .setJpegQuality(100)
                             .setTargetRotation(view.display?.rotation ?: Surface.ROTATION_0)
                             .build()
                     runCatching {
@@ -213,8 +214,8 @@ fun CameraCaptureScreen(
                 AndroidView(
                     factory = { ctx ->
                         PreviewView(ctx).apply {
-                            scaleType = PreviewView.ScaleType.FILL_CENTER
-                            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+                            scaleType = PreviewView.ScaleType.FIT_CENTER
+                            implementationMode = PreviewView.ImplementationMode.PERFORMANCE
                             keepScreenOn = true
                             previewView = this
                         }
