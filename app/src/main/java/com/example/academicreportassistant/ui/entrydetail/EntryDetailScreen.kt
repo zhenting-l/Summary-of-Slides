@@ -2,8 +2,6 @@ package com.lzt.summaryofslides.ui.entrydetail
 
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import android.net.Uri
-import androidx.activity.compose.ManagedActivityResultLauncher
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -36,7 +34,6 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -56,11 +53,9 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
 import androidx.compose.ui.layout.ContentScale
 import com.lzt.summaryofslides.data.repo.EntryRepository
-import com.lzt.summaryofslides.util.createTempCameraFile
-import com.lzt.summaryofslides.util.fileToContentUri
 import com.lzt.summaryofslides.util.openPdf
-import java.io.File
 import androidx.compose.ui.text.input.TextFieldValue
+import java.io.File
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -68,6 +63,7 @@ fun EntryDetailScreen(
     entryId: String,
     onBack: () -> Unit,
     onShare: () -> Unit,
+    onOpenCameraCapture: () -> Unit,
     onOpenSummary: () -> Unit,
     onOpenSummaryHistory: () -> Unit,
 ) {
@@ -78,39 +74,14 @@ fun EntryDetailScreen(
     val errorState = vm.errorMessage.collectAsState()
     val summaryCountState = vm.summaryCount.collectAsState()
     val context = LocalContext.current
-    var pendingCameraFile: File? by remember { mutableStateOf(null) }
     var showPdfListDialog by remember { mutableStateOf(false) }
     var pendingDeleteImageId by remember { mutableStateOf<String?>(null) }
     var pendingDeletePdfId by remember { mutableStateOf<String?>(null) }
     var previewImageFile by remember { mutableStateOf<File?>(null) }
     var extraPrompt by remember { mutableStateOf(TextFieldValue("")) }
     var showExtraPromptDialog by remember { mutableStateOf(false) }
-    var continuousCapture by remember { mutableStateOf(false) }
     var showAnalysisOptionsDialog by remember { mutableStateOf(false) }
     var batchImages by remember { mutableStateOf(true) }
-
-    val takePictureLauncherRef =
-        remember { mutableStateOf<ManagedActivityResultLauncher<Uri, Boolean>?>(null) }
-    val takePictureLauncher =
-        rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { success ->
-            val file = pendingCameraFile
-            if (success && file != null) {
-                vm.importCapturedFile(file) {
-                    if (continuousCapture) {
-                        val next = createTempCameraFile(context)
-                        pendingCameraFile = next
-                        takePictureLauncherRef.value?.launch(fileToContentUri(context, next))
-                    }
-                }
-            } else {
-                file?.delete()
-                continuousCapture = false
-            }
-            pendingCameraFile = null
-        }
-    SideEffect {
-        takePictureLauncherRef.value = takePictureLauncher
-    }
 
     val pickImagesLauncher =
         rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
@@ -154,12 +125,7 @@ fun EntryDetailScreen(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Button(
-                    onClick = {
-                        continuousCapture = true
-                        val file = createTempCameraFile(context)
-                        pendingCameraFile = file
-                        takePictureLauncher.launch(fileToContentUri(context, file))
-                    },
+                    onClick = onOpenCameraCapture,
                     modifier = Modifier.weight(1f),
                     colors = importBtnColors,
                 ) {

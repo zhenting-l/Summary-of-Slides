@@ -9,6 +9,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import com.lzt.summaryofslides.ui.camera.CameraCaptureScreen
 import com.lzt.summaryofslides.ui.entrydetail.EntryDetailScreen
 import com.lzt.summaryofslides.ui.entrylist.EntryListScreen
 import com.lzt.summaryofslides.ui.share.ShareScreen
@@ -24,6 +25,7 @@ import com.lzt.summaryofslides.ui.summary.SummaryScreen
 object Routes {
     const val EntryList = "entry_list"
     const val EntryDetail = "entry_detail"
+    const val CameraCapture = "camera_capture"
     const val Summary = "summary"
     const val SummaryHistory = "summary_history"
     const val SummaryDetail = "summary_detail"
@@ -62,8 +64,19 @@ fun AppNav() {
                 entryId = entryId,
                 onBack = { navController.popBackStack() },
                 onShare = { navController.navigate("${Routes.Share}/$entryId") },
+                onOpenCameraCapture = { navController.navigate("${Routes.CameraCapture}/$entryId") },
                 onOpenSummary = { navController.navigate("${Routes.Summary}/$entryId") },
                 onOpenSummaryHistory = { navController.navigate("${Routes.SummaryHistory}/$entryId") },
+            )
+        }
+        composable(
+            route = "${Routes.CameraCapture}/{entryId}",
+            arguments = listOf(navArgument("entryId") { type = NavType.StringType }),
+        ) { backStackEntry ->
+            val entryId = requireNotNull(backStackEntry.arguments?.getString("entryId"))
+            CameraCaptureScreen(
+                entryId = entryId,
+                onBack = { navController.popBackStack() },
             )
         }
         composable(
